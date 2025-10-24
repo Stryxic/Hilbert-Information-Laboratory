@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: "Hilbert Information Laboratory: Computational Modelling of Trust and Disinformation"
+authors:
+  - family-names: Fox
+    given-names: Swift
+version: "1.0"
+date-released: 2025-10-24
+repository-code: "https://github.com/SwiftFox/hilbert-information-laboratory"
+license: MIT
+doi: "10.5281/zenodo.placeholder"
