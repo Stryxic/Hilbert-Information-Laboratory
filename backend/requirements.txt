@@ -1,0 +1,65 @@
+# ------------------------------
+# Web framework
+# ------------------------------
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# ------------------------------
+# Core numerical / data science
+# ------------------------------
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.5
+
+# ------------------------------
+# NLP layer (LSA, spaCy primitives)
+# ------------------------------
+spacy>=3.7
+spacy-loggers>=1.0
+# Required English model
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# ------------------------------
+# Plotting / Visualisation
+# ------------------------------
+matplotlib>=3.8
+networkx>=3.2
+
+# ------------------------------
+# PDF / Export
+# ------------------------------
+reportlab>=4.1
+pillow>=10.0
+
+# ------------------------------
+# Zip/tar export (Python stdlib ok, but backports safe)
+# ------------------------------
+pyzipper>=0.3
+
+# ------------------------------
+# For the C-native Hilbert engine bindings
+# ------------------------------
+pybind11>=2.12
+setuptools>=69.0
+wheel>=0.41
+
+# ------------------------------
+# Optional: improves clustering in molecule layer
+# ------------------------------
+hdbscan>=0.8
+
+# ------------------------------
+# Optional: Temperature scaling / interpolation in element labels
+# ------------------------------
+numba>=0.59
+
+# ------------------------------
+# Testing
+# ------------------------------
+pytest>=8.0
+
+# ------------------------------
+# Utility
+# ------------------------------
+tqdm>=4.66
