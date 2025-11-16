@@ -20,17 +20,12 @@ jobs:
           auto-activate-base: false
           use-mamba: true
 
-      - name: Verify Conda environment
-        run: |
-          echo "Python:" $(python --version)
-          echo "Conda env:" $(conda info --envs)
-
-      - name: Install package (PEP517)
+      - name: Install package
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Install linters & pytest
+      - name: Install lint/test tools
         run: |
           pip install flake8 pytest
 
