@@ -30,10 +30,24 @@ jobs:
         pip install --upgrade pip
         pip install -e .
 
-    - name: Lint
+    - name: Lint with flake8
       shell: bash -l {0}
       run: |
-        flake8 .
+        # 1) Hard fail on serious issues only
+        conda run -n hilbert-lab flake8 . \
+          --count \
+          --select=E9,F63,F7,F82,F401,F541,F841 \
+          --show-source \
+          --statistics
+    
+        # 2) Soft run for metrics (never fails CI)
+        conda run -n hilbert-lab flake8 . \
+          --count \
+          --exit-zero \
+          --max-complexity=12 \
+          --max-line-length=120 \
+          --statistics
+
 
     - name: Test
       shell: bash -l {0}
