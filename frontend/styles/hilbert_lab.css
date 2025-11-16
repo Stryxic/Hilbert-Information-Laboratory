@@ -1,0 +1,318 @@
+/* =======================================================
+   Hilbert Information Chemistry Lab — Unified Stylesheet
+   ======================================================= */
+
+/* -------------------------------------------------------
+   Global Colors & Fonts
+------------------------------------------------------- */
+:root {
+  --bg-primary: #0d1117;
+  --bg-panel: #161b22;
+  --bg-toolbar: rgba(10, 15, 20, 0.9);
+  --border-color: #30363d;
+  --accent-blue: #58a6ff;
+  --accent-cyan: #06b6d4;
+  --accent-green: #10b981;
+  --accent-yellow: #facc15;
+  --accent-red: #ef4444;
+  --text-main: #e6edf3;
+  --text-dim: #8b949e;
+  --panel-radius: 10px;
+  --transition-fast: 0.25s ease;
+  --transition-slow: 0.45s ease;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: radial-gradient(circle at 60% 40%, #10141c, #0a0d12 80%);
+  color: var(--text-main);
+  font-family: "Inter", "Segoe UI", Roboto, system-ui, -apple-system, sans-serif;
+}
+
+/* =======================================================
+   DASHBOARD ROOT
+======================================================= */
+.hilbert-dashboard {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: radial-gradient(circle at 60% 40%, #10141c, #0a0d12 80%);
+}
+
+/* =======================================================
+   TOOLBAR
+======================================================= */
+.hilbert-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  padding: 0.6rem 1rem;
+  backdrop-filter: blur(6px);
+}
+
+.hilbert-toolbar button,
+.hilbert-toolbar label {
+  transition: all var(--transition-fast);
+}
+
+.hilbert-toolbar button:hover,
+.hilbert-toolbar label:hover {
+  filter: brightness(1.1);
+}
+
+.hilbert-toolbar select {
+  background: var(--bg-primary);
+  color: var(--text-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 4px 8px;
+  outline: none;
+}
+
+.hilbert-toolbar .spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* =======================================================
+   GRID SYSTEM
+======================================================= */
+.hilbert-grid-layout {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+}
+
+.react-grid-item.react-grid-placeholder {
+  background: rgba(88, 166, 255, 0.2);
+  border: 1px dashed var(--accent-blue);
+  border-radius: 8px;
+}
+
+/* =======================================================
+   PANEL CONTAINERS
+======================================================= */
+.hilbert-panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--panel-radius);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: all var(--transition-fast);
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.35);
+}
+
+.hilbert-panel:hover {
+  box-shadow: 0 0 18px rgba(88, 166, 255, 0.2);
+}
+
+/* =======================================================
+   PANEL HEADER
+======================================================= */
+.hilbert-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: rgba(18, 24, 30, 0.85);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--accent-blue);
+  user-select: none;
+  cursor: grab;
+}
+
+.hilbert-panel-header button {
+  border: none;
+  background: transparent;
+  color: var(--accent-red);
+  font-weight: bold;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+.hilbert-panel-header button:hover {
+  color: #ff7070;
+}
+
+/* =======================================================
+   PANEL BODY
+======================================================= */
+.hilbert-panel-body {
+  flex: 1;
+  padding: 8px;
+  background: var(--bg-panel);
+  font-size: 0.9rem;
+  line-height: 1.4;
+  overflow-y: auto;
+  scrollbar-color: #30363d transparent;
+  scrollbar-width: thin;
+}
+.hilbert-panel-body::-webkit-scrollbar {
+  width: 6px;
+}
+.hilbert-panel-body::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 6px;
+}
+.hilbert-panel-body::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+
+/* =======================================================
+   LOCK TOGGLE BUTTON
+======================================================= */
+.layout-lock-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-panel);
+  color: var(--text-main);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: box-shadow var(--transition-fast);
+}
+
+.layout-lock-toggle:hover {
+  box-shadow: 0 0 10px rgba(88, 166, 255, 0.25);
+}
+
+.layout-lock-toggle.locked {
+  color: var(--accent-green);
+  border-color: #2ea04355;
+}
+.layout-lock-toggle.unlocked {
+  color: var(--accent-blue);
+  border-color: #58a6ff99;
+}
+
+/* =======================================================
+   CONSOLE (LOG OUTPUT)
+======================================================= */
+.hilbert-console {
+  background: var(--bg-primary);
+  border-top: 1px solid var(--border-color);
+  max-height: 22vh;
+  min-height: 100px;
+  overflow-y: auto;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.hilbert-console .console-header {
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  color: var(--accent-blue);
+  padding: 4px 10px;
+  font-weight: bold;
+}
+
+.hilbert-console .console-body {
+  padding: 6px 10px;
+  line-height: 1.3;
+  font-size: 0.8rem;
+}
+
+/* =======================================================
+   RESPONSIVE ADAPTATION
+======================================================= */
+@media (max-width: 1200px) {
+  .hilbert-panel {
+    font-size: 0.85rem;
+  }
+  .hilbert-panel-header {
+    padding: 5px 8px;
+  }
+}
+
+@media (max-width: 920px) {
+  .hilbert-grid-layout {
+    display: block !important;
+    overflow-y: auto;
+    padding: 10px;
+  }
+  .hilbert-panel {
+    width: 100% !important;
+    margin-bottom: 1rem;
+  }
+}
+
+@media (max-width: 680px) {
+  .hilbert-panel-header {
+    font-size: 0.8rem;
+  }
+}
+
+/* =======================================================
+   PERIODIC GRID (Optional)
+======================================================= */
+.periodic-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 0.75rem;
+  padding: 0.5rem;
+}
+
+.periodic-cell {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.5rem;
+  text-align: center;
+  color: var(--text-main);
+  transition: all 0.2s ease;
+}
+.periodic-cell:hover {
+  transform: scale(1.05);
+  box-shadow: 0 0 12px rgba(88, 166, 255, 0.25);
+}
+.periodic-cell .symbol {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--accent-blue);
+}
+.periodic-cell .name {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+.periodic-cell .keywords {
+  font-size: 0.7rem;
+  color: var(--text-main);
+  opacity: 0.7;
+  margin-top: 0.3rem;
+}
+
+/* =======================================================
+   VISUAL ENHANCEMENTS
+======================================================= */
+.hilbert-panel img {
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+.hilbert-panel iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #0d1117;
+}
