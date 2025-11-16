@@ -1,0 +1,97 @@
+name: Hilbert Research Build (Conda + Native)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    env:
+      # Ensure conda is non-interactive
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python (base for tools)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Add conda to PATH
+        run: |
+          echo "$CONDA/bin" >> $GITHUB_PATH
+
+      - name: Create and update conda environment
+        run: |
+          conda env update --file environment.yml --name base
+          conda activate base
+          python --version
+          which python
+
+      - name: Install build tools (gcc, make) via conda
+        run: |
+          conda install -y make gcc
+
+      - name: Install Python dev tools (for lint/tests)
+        run: |
+          conda install -y pytest flake8
+          # Optional: spaCy model if not included in environment.yml
+          python -m spacy download en_core_web_sm || true
+
+      - name: Build Hilbert native engine
+        working-directory: backend/native
+        run: |
+          conda activate base
+          make clean || true
+          make
+          ls -lh
+
+      - name: Lint Python sources
+        run: |
+          conda activate base
+          # strict pass/fail for syntax and undef
+          flake8 backend src --count --select=E9,F63,F7,F82 --show-source --statistics
+          # relaxed style run (does not fail build)
+          flake8 backend src --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Python import smoke test
+        run: |
+          conda activate base
+          python -c "import backend.app; print('Loaded backend.app OK')"
+          python -c "import hilbert_pipeline.lsa_layer as l; print('Loaded LSA layer OK')"
+
+      - name: Pipeline smoke run (small corpus)
+        run: |
+          conda activate base
+          # Create tiny test corpus if you don't have one in repo
+          mkdir -p backend/uploaded_corpus
+          echo 'This is a tiny test document for the Hilbert pipeline.' > backend/uploaded_corpus/test_doc.txt
+
+          # Run orchestrator in a minimal mode (adjust flag if you have one)
+          python backend/hilbert_orchestrator.py \
+            --corpus backend/uploaded_corpus \
+            --out backend/results/ci_run || python backend/hilbert_orchestrator.py
+
+      - name: Run pytest (if tests exist)
+        run: |
+          conda activate base
+          if ls tests 1> /dev/null 2>&1; then
+            pytest -q
+          else
+            echo "No tests/ directory, skipping pytest."
+          fi
+
+      - name: Upload artifacts (results and native engine)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hilbert-ci-artifacts
+          path: |
+            backend/results/
+            backend/native/hilbert_native*.so
+            backend/native/hilbert_native*.pyd
+          if-no-files-found: ignore
