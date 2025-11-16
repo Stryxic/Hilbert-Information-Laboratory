@@ -1,0 +1,141 @@
+{
+  "scenario": "Connor Reed COVID-19 Misinformation Cascade",
+  "description": "Timeline of articles, posts, and related misinformation surrounding the Connor Reed case (Jan–Apr 2020). Each entry includes date, outlet, author, headline, classification, trust metrics, and mapped filenames.",
+  "timespan": {
+    "start": "2020-02-01",
+    "end": "2020-04-27"
+  },
+  "events": [
+    {
+      "date": "2020-02-01",
+      "source": "World Health Organization (WHO)",
+      "author": "WHO Press Office",
+      "headline": "Recommendations to reduce risk of transmission of emerging pathogens",
+      "classification": "Information",
+      "trust_level": "High",
+      "type": "Official Memo",
+      "description": "Early WHO communication about zoonotic origins of COVID-19.",
+      "filename": ""
+    },
+    {
+      "date": "2020-02-03",
+      "source": "The Sun",
+      "author": "Nick Pisa",
+      "headline": "HOT TODDY ‘REMEDY’ Coronavirus UK – First Brit known to catch virus ‘beat deadly flu with glass of hot whisky and honey’",
+      "classification": "Disinformation",
+      "trust_level": "High",
+      "description": "Sensationalised reporting implying whisky and honey cured COVID-19.",
+      "filename": "reed_sun.txt"
+    },
+    {
+      "date": "2020-02-03",
+      "source": "New York Post",
+      "author": "Lee Brown",
+      "headline": "UK teacher claims he beat coronavirus with ‘hot whisky and honey’",
+      "classification": "Disinformation",
+      "trust_level": "High",
+      "description": "Amplified The Sun’s original claim internationally.",
+      "filename": "reed_ny_post.txt"
+    },
+    {
+      "date": "2020-02-03",
+      "source": "North Wales Live",
+      "author": "Mari Jones",
+      "headline": "Coronavirus victim from North Wales thought to be first UK national to contract killer disease",
+      "classification": "Information",
+      "trust_level": "High",
+      "description": "Local factual reporting confirming Connor Reed’s identity and background.",
+      "filename": "reed_nwlive.txt"
+    },
+    {
+      "date": "2020-02-04",
+      "source": "North Wales Pioneer",
+      "author": "Suzanne Kendrick",
+      "headline": "Connor Reed who caught coronavirus thought he had bad case of flu",
+      "classification": "Information",
+      "trust_level": "High",
+      "description": "Follow-up interview correcting national reporting errors.",
+      "filename": "reed_nwpioneer.txt"
+    },
+    {
+      "date": "2020-02-04",
+      "source": "Vice",
+      "author": "Jelisa Castrodale",
+      "headline": "25-Year-Old Man Claims Whisky Cured His Coronavirus",
+      "classification": "Information (Corrective)",
+      "trust_level": "High",
+      "description": "Attempts to correct and contextualise misinformation in The Sun.",
+      "filename": "reed_vice.txt"
+    },
+    {
+      "date": "2020-02-05",
+      "source": "Men’s Health",
+      "author": "Daniel Davies",
+      "headline": "This Man Claims He Cured His Coronavirus by Drinking Hot Whisky and Honey",
+      "classification": "Misinformation",
+      "trust_level": "High",
+      "description": "Lifestyle coverage repeating cure claims with less verification.",
+      "filename": "reed_mh.txt"
+    },
+    {
+      "date": "2020-03-04",
+      "source": "Daily Mail",
+      "author": "Connor Reed",
+      "headline": "What it’s REALLY like to catch coronavirus: First British victim, 25, describes his ordeal",
+      "classification": "Information (Primary Source)",
+      "trust_level": "High",
+      "description": "Connor Reed’s personal diary correcting earlier media distortions.",
+      "filename": "reed_base_text.txt"
+    },
+    {
+      "date": "2020-03-07",
+      "source": "Sky News",
+      "author": "Jason Farrell",
+      "headline": "Coronavirus: One of the first British sufferers describes his ordeal",
+      "classification": "Information",
+      "trust_level": "High",
+      "description": "Video interview contextualizing Reed’s experience.",
+      "filename": "reed_sky.txt"
+    },
+    {
+      "date": "2020-03-09",
+      "source": "Business Standard",
+      "author": "IRNA / Staff",
+      "headline": "Bootleg booze kills 27 in Iran after virus ‘cure’ rumours",
+      "classification": "Information",
+      "trust_level": "Medium",
+      "description": "First report of deaths linked to belief in alcohol as a COVID cure.",
+      "filename": "business_standard.txt"
+    },
+    {
+      "date": "2020-03-10",
+      "source": "USA Today",
+      "author": "Joshua Bote",
+      "headline": "44 dead in Iran after drinking toxic alcohol due to fake coronavirus cure rumours",
+      "classification": "Information",
+      "trust_level": "High",
+      "description": "Follow-up confirming misinformation’s deadly effects.",
+      "filename": "usatoday.txt"
+    },
+    {
+      "date": "2020-04-01",
+      "source": "Daily Post",
+      "author": "Mari Jones",
+      "headline": "Tragic link between North Wales man and Iranian alcohol deaths",
+      "classification": "Information",
+      "trust_level": "High",
+      "description": "Connects Reed’s story to global misinformation impact.",
+      "filename": "daily_post.txt"
+    },
+    {
+      "date": "2020-04-27",
+      "source": "Al Jazeera",
+      "author": "News Agencies",
+      "headline": "Iran: Over 700 dead after drinking alcohol to 'cure' coronavirus",
+      "classification": "Information",
+      "trust_level": "High",
+      "description": "Final escalation point; confirms cumulative fatalities from misinformation.",
+      "filename": "aljazeera.txt"
+    }
+  ]
+}

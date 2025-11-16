@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hilbert-lab.org/schema.json",
+  "title": "Hilbert Information Chemistry Lab – Full Schema",
+  "description": "Unified schema for spectral field, elements, relationships, molecules, compounds, documents, and timeline.",
+  "type": "object",
+
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["ok", "error"]
+    },
+
+    "meta": {
+      "type": "object",
+      "properties": {
+        "run": { "type": "string" },
+        "dir": { "type": "string" },
+        "generated_at": { "type": "string" }
+      },
+      "required": ["run", "dir", "generated_at"]
+    },
+
+    "field": {
+      "type": "object",
+      "description": "Spectral span field (LSA layer)",
+      "properties": {
+        "spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "span_id": { "type": "integer" },
+              "doc": { "type": "string" },
+              "text": { "type": "string" },
+              "entropy": { "type": "number" },
+              "coherence": { "type": "number" },
+              "stability": { "type": "number" }
+            },
+            "required": ["span_id", "doc", "text"]
+          }
+        },
+        "global": {
+          "type": "object",
+          "properties": {
+            "H_bar": { "type": "number" },
+            "C_global": { "type": "number" },
+            "n_spans": { "type": "integer" }
+          },
+          "required": ["H_bar", "C_global", "n_spans"]
+        }
+      },
+      "required": ["spans", "global"]
+    },
+
+    "elements": {
+      "type": "object",
+      "description": "Element (agent) layer",
+      "properties": {
+        "elements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "element": { "type": "string" },
+              "token": { "type": "string" },
+              "doc": { "type": "string" },
+              "tf": { "type": "integer" },
+              "df": { "type": "integer" },
+              "entropy": { "type": "number" },
+              "coherence": { "type": "number" },
+              "embedding": {
+                "type": "array",
+                "items": { "type": "number" }
+              },
+              "root_element": { "type": "string" },
+              "info_score": { "type": "number" },
+              "misinfo_score": { "type": "number" },
+              "disinfo_score": { "type": "number" }
+            },
+            "required": ["element", "token"]
+          }
+        },
+        "stats": {
+          "type": "object",
+          "properties": {
+            "n_elements": { "type": "integer" },
+            "n_roots": { "type": "integer" }
+          }
+        }
+      },
+      "required": ["elements"]
+    },
+
+    "edges": {
+      "type": "object",
+      "description": "Relationship (bond) layer",
+      "properties": {
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "source": { "type": "string" },
+              "target": { "type": "string" },
+              "weight": { "type": "number" }
+            },
+            "required": ["source", "target", "weight"]
+          }
+        },
+        "stats": {
+          "type": "object",
+          "properties": {
+            "n_edges": { "type": "integer" },
+            "similarity_threshold": { "type": "number" },
+            "top_k": { "type": "integer" }
+          }
+        }
+      },
+      "required": ["edges"]
+    },
+
+    "compounds": {
+      "type": "object",
+      "description": "Informational molecules / compounds",
+      "properties": {
+        "compounds": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "compound_id": { "type": "string" },
+              "elements": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "num_elements": { "type": "integer" },
+              "num_bonds": { "type": "integer" },
+              "compound_stability": { "type": "number" },
+              "mean_temperature": { "type": "number" },
+              "regime_profile": {
+                "type": "object",
+                "properties": {
+                  "info": { "type": "number" },
+                  "misinfo": { "type": "number" },
+                  "disinfo": { "type": "number" }
+                }
+              },
+              "graph": {
+                "type": "object",
+                "properties": {
+                  "nodes": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": { "type": "string" },
+                        "entropy": { "type": "number" },
+                        "coherence": { "type": "number" }
+                      },
+                      "required": ["id"]
+                    }
+                  },
+                  "edges": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "source": { "type": "string" },
+                        "target": { "type": "string" },
+                        "weight": { "type": "number" }
+                      },
+                      "required": ["source", "target", "weight"]
+                    }
+                  }
+                }
+              }
+            },
+            "required": ["compound_id", "elements"]
+          }
+        },
+        "stats": {
+          "type": "object",
+          "properties": {
+            "n_compounds": { "type": "integer" }
+          }
+        }
+      },
+      "required": ["compounds"]
+    },
+
+    "documents": {
+      "type": "object",
+      "description": "Per-document signatures",
+      "properties": {
+        "documents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "doc": { "type": "string" },
+              "signature": {
+                "type": "object",
+                "properties": {
+                  "top_elements": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "element": { "type": "string" },
+                        "tf": { "type": "number" },
+                        "entropy": { "type": "number" }
+                      },
+                      "required": ["element"]
+                    }
+                  },
+                  "compound_membership": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  },
+                  "entropy_distribution": {
+                    "type": "object",
+                    "properties": {
+                      "mean": { "type": "number" },
+                      "stdev": { "type": "number" }
+                    }
+                  }
+                }
+              }
+            },
+            "required": ["doc", "signature"]
+          }
+        }
+      },
+      "required": ["documents"]
+    },
+
+    "timeline": {
+      "type": "object",
+      "description": "Span-level timeline annotations",
+      "properties": {
+        "timeline": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "span_id": { "type": "integer" },
+              "timestamp": { "type": "string" },
+              "stability": { "type": "number" },
+              "entropy": { "type": "number" },
+              "coherence": { "type": "number" },
+              "doc": { "type": "string" }
+            },
+            "required": ["span_id", "timestamp", "doc"]
+          }
+        }
+      },
+      "required": ["timeline"]
+    },
+
+    "figures": {
+      "type": "object",
+      "description": "URLs to visual artefacts.",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+
+  "required": ["status", "meta", "field", "elements", "edges", "compounds"]
+}
