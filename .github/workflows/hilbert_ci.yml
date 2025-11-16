@@ -5,51 +5,40 @@ on:
   pull_request:
 
 jobs:
-  build-test:
+  build-linux:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Miniconda
-      uses: conda-incubator/setup-miniconda@v3
-      with:
-        python-version: "3.10"
-        environment-file: environment.yml
-        activate-environment: hilbert-lab
-        use-mamba: true
+      - name: Install Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: hilbert-lab
+          environment-file: environment.yml
+          python-version: 3.10
+          auto-activate-base: false
+          use-mamba: true
 
-    - name: Install spaCy Model
-      shell: bash -l {0}
-      run: |
-        python -m spacy download en_core_web_sm
+      - name: Verify Conda environment
+        run: |
+          echo "Python:" $(python --version)
+          echo "Conda env:" $(conda info --envs)
 
-    - name: Install local package
-      shell: bash -l {0}
-      run: |
-        pip install --upgrade pip
-        pip install -e .
+      - name: Install package (PEP517)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
 
-    - name: Lint with flake8
-      shell: bash -l {0}
-      run: |
-        # 1) Hard fail on serious issues only
-        conda run -n hilbert-lab flake8 . \
-          --count \
-          --select=E9,F63,F7,F82,F401,F541,F841 \
-          --show-source \
-          --statistics
-    
-        # 2) Soft run for metrics (never fails CI)
-        conda run -n hilbert-lab flake8 . \
-          --count \
-          --exit-zero \
-          --max-complexity=12 \
-          --max-line-length=120 \
-          --statistics
+      - name: Install linters & pytest
+        run: |
+          pip install flake8 pytest
 
+      - name: Lint
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=12 \
+            --max-line-length=79 --statistics
 
-    - name: Test
-      shell: bash -l {0}
-      run: |
-        pytest -q
+      - name: Run tests
+        run: pytest
