@@ -1,0 +1,41 @@
+name: Hilbert CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Miniconda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        python-version: "3.10"
+        environment-file: environment.yml
+        activate-environment: hilbert-lab
+        use-mamba: true
+
+    - name: Install spaCy Model
+      shell: bash -l {0}
+      run: |
+        python -m spacy download en_core_web_sm
+
+    - name: Install local package
+      shell: bash -l {0}
+      run: |
+        pip install --upgrade pip
+        pip install -e .
+
+    - name: Lint
+      shell: bash -l {0}
+      run: |
+        flake8 .
+
+    - name: Test
+      shell: bash -l {0}
+      run: |
+        pytest -q
