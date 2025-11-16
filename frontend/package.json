@@ -27,7 +27,7 @@
     "react-resizable": "^3.0.5",
     "recharts":"^2.10.4",
     "tailwind-merge":"^3.4.0",
-    "three":"^0.181.0"
+    "three":"^0.181.0",
 
     "react-router-dom": "^6.26.2",
 
