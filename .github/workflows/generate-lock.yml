@@ -1,0 +1,28 @@
+name: Generate Lockfile
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate package-lock.json
+        working-directory: frontend
+        run: |
+          rm -f package-lock.json
+          npm install
+
+      - name: Commit lockfile
+        run: |
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add frontend/package-lock.json
+          git commit -m "Auto-generate package-lock.json" || echo "No changes"
+          git push
