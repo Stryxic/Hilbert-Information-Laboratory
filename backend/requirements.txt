@@ -63,3 +63,6 @@ pytest>=8.0
 # Utility
 # ------------------------------
 tqdm>=4.66
+
+python-multipart
+jinja2
