@@ -1,23 +1,20 @@
-name: Generate Lockfile
-
-on:
-  workflow_dispatch:
-
 permissions:
   contents: write
 
 jobs:
-  build:
+  generate-lockfile:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # IMPORTANT: allows rebase
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Generate package-lock.json
+      - name: Install dependencies
         working-directory: frontend
         run: |
           rm -f package-lock.json
@@ -27,6 +24,9 @@ jobs:
         run: |
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
+
           git add frontend/package-lock.json
           git commit -m "Auto-generate package-lock.json" || echo "No changes"
-          git push
+
+          git pull --rebase origin main || true
+          git push origin main
