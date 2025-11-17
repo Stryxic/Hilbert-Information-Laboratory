@@ -3,9 +3,13 @@ name: Generate Lockfile
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
