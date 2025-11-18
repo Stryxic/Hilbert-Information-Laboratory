@@ -17,6 +17,7 @@ venv/
 # Build / packaging
 build/
 dist/
+frontend/node_modules/
 *.egg
 *.whl
 *.log
@@ -32,11 +33,7 @@ dist/
 *.so
 
 # Simulation logs and large data files
-data/logs/
-data/results/
-data/metrics/
-data/temp/
-output/
+backend/results/
 *.csv
 *.jsonl
 *.npy
@@ -61,3 +58,11 @@ Desktop.ini
 *.svg
 *.pdf
 *.eps
+
+
+#C Files
+*.exp
+*.lib
+
+*.jsonl
+

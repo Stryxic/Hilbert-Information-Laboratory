@@ -1,195 +1,189 @@
-# Package for Hilbert pipeline modules.
-# =============================================================================
-# hilbert_pipeline/element_labels.py — Element Naming & Descriptors
-# =============================================================================
 """
-Derives human-readable labels and descriptors for Hilbert elements based on
-their statistical behavior across the corpus.
+Hilbert Information Pipeline - public API aggregator.
 
-Inputs:
-    - hilbert_elements.csv (doc,sid,element,probability,entropy,coherence,stability)
-    - spans: list of span dicts from orchestrator (optional, for examples)
+This module re-exports the main computational primitives of the pipeline so that
+the orchestrator and any higher level tools can import everything from the
+`hilbert_pipeline` package root.
 
-Outputs:
-    - element_descriptions.json
-    - element_intensity.csv
+It also defines DEFAULT_EMIT, a no-op logger used as a safe fallback by
+optional layers such as the epistemic signatures module.
 """
 
-import os
-import json
-from typing import List, Dict
-import numpy as np
-import pandas as pd
+from __future__ import annotations
 
+from typing import Any, Callable, Dict, Optional
 
-def _categorize_role(mean_entropy: float, mean_coherence: float) -> str:
+# ======================================================================
+# Default emitter
+# ======================================================================
+
+def DEFAULT_EMIT(kind: str, payload: Optional[Dict[str, Any]] = None) -> None:
     """
-    Rough role categorization:
-      - low entropy, high coherence    -> backbone / anchor
-      - high entropy, high coherence   -> diverse-but-focused
-      - low coherence                  -> fringe / volatile
+    Fallback "do nothing" emitter.
+
+    Real callers (the orchestrator, web API, CLI) usually provide their own
+    `emit(kind, payload)` function. Code inside pipeline modules should always
+    accept an `emit` argument but never rely on it doing anything.
     """
-    if mean_coherence >= 0.65 and mean_entropy <= 0.45:
-        return "backbone"
-    if mean_coherence >= 0.65 and mean_entropy > 0.45:
-        return "focused-diverse"
-    if mean_coherence < 0.35 and mean_entropy >= 0.55:
-        return "volatile"
-    if mean_coherence < 0.35:
-        return "fringe"
-    return "neutral"
+    return None
 
 
-def _generate_name(element_id: str, role: str) -> str:
+# ======================================================================
+# LSA layer
+# ======================================================================
+
+from .lsa_layer import (  # noqa: E402,F401
+    build_lsa_field,
+)
+
+
+# ======================================================================
+# Molecule layer
+# ======================================================================
+
+from .molecule_layer import (  # noqa: E402,F401
+    run_molecule_stage,
+    aggregate_compounds,
+    compute_molecule_stability,
+    compute_molecule_temperature,
+    export_molecule_summary,
+)
+
+def build_molecules(*args, **kwargs):
+    """Backwards compatible alias expected by older orchestrator code."""
+    return run_molecule_stage(*args, **kwargs)
+
+def run_molecule_layer(*args, **kwargs):
+    """Compatibility alias - identical to `run_molecule_stage`."""
+    return run_molecule_stage(*args, **kwargs)
+
+
+# ======================================================================
+# Span - element fusion and compound context
+# ======================================================================
+
+from .fusion import (  # noqa: E402,F401
+    fuse_spans_to_elements,
+    aggregate_compound_context,
+)
+
+def run_fusion_pipeline(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
     """
-    Generate a compact human-readable name based on role.
+    Thin wrapper for span -> element fusion + compound context aggregation.
     """
-    base = element_id
-    if role == "backbone":
-        return f"{base} — Core Factual Backbone"
-    if role == "focused-diverse":
-        return f"{base} — Thematic Hub"
-    if role == "volatile":
-        return f"{base} — Volatile Discourse"
-    if role == "fringe":
-        return f"{base} — Peripheral Context"
-    return f"{base} — Neutral Carrier"
+    fuse_spans_to_elements(results_dir, emit=emit)
+    aggregate_compound_context(results_dir, emit=emit)
 
 
-def _generate_description(element_id: str,
-                          role: str,
-                          mean_entropy: float,
-                          mean_coherence: float,
-                          doc_coverage: float) -> str:
-    """
-    Short descriptor; keep it informative but compact.
-    """
-    ent = f"{mean_entropy:.2f}"
-    coh = f"{mean_coherence:.2f}"
-    cov = f"{100.0 * doc_coverage:.1f}%"
+# ======================================================================
+# Element labels and descriptions
+# ======================================================================
 
-    if role == "backbone":
-        return (
-            f"{element_id} appears consistently across documents with low lexical noise "
-            f"(entropy {ent}) and strong alignment (coherence {coh}). It acts as a "
-            f"stable factual backbone (~{cov} of docs)."
-        )
-    if role == "focused-diverse":
-        return (
-            f"{element_id} clusters many varied expressions (entropy {ent}) around a "
-            f"shared theme (coherence {coh}), serving as a central thematic hub "
-            f"spanning ~{cov} of documents."
-        )
-    if role == "volatile":
-        return (
-            f"{element_id} is highly variable (entropy {ent}) with weak alignment "
-            f"(coherence {coh}), indicating volatile or contested framings. Present in "
-            f"~{cov} of documents."
-        )
-    if role == "fringe":
-        return (
-            f"{element_id} surfaces sporadically with low coherence (coherence {coh}), "
-            f"acting as a fringe or contextual modifier (~{cov} of docs)."
-        )
-    return (
-        f"{element_id} exhibits moderate entropy ({ent}) and coherence ({coh}), "
-        f"providing neutral connective tissue across ~{cov} of documents."
-    )
+from .element_labels import (  # noqa: E402,F401
+    build_element_descriptions,
+)
 
 
-def build_element_descriptions(elements_csv: str,
-                               spans: List[Dict],
-                               out_dir: str) -> str:
-    """
-    Construct element_descriptions.json and element_intensity.csv.
+# ======================================================================
+# Stability / persistence visuals
+# ======================================================================
 
-    Parameters
-    ----------
-    elements_csv : str
-        Path to hilbert_elements.csv produced by orchestrator.
-    spans : list of dict
-        Span metadata; used only for optional context (not required).
-    out_dir : str
-        Output directory for JSON/CSV.
+from .stability_layer import (  # noqa: E402,F401
+    compute_signal_stability,
+)
 
-    Returns
-    -------
-    str : path to element_descriptions.json
-    """
-    os.makedirs(out_dir, exist_ok=True)
+from .persistence_visuals import (  # noqa: E402,F401
+    plot_persistence_field,
+)
 
-    if not os.path.exists(elements_csv):
-        print(f"[elements] Missing {elements_csv}; cannot build descriptions.")
-        path = os.path.join(out_dir, "element_descriptions.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=2)
-        return path
+def run_persistence_visuals(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
+    """Compatibility wrapper for persistence visuals."""
+    emit("log", {"stage": "persistence_visuals", "event": "start"})
+    plot_persistence_field(results_dir)
+    emit("log", {"stage": "persistence_visuals", "event": "end"})
 
-    df = pd.read_csv(elements_csv)
-    if df.empty or "element" not in df.columns:
-        print("[elements] Empty or invalid hilbert_elements.csv.")
-        path = os.path.join(out_dir, "element_descriptions.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=2)
-        return path
 
-    # Ensure expected numeric fields
-    for col in ("entropy", "coherence", "stability", "probability"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["doc"] = df.get("doc", "").astype(str)
+# ======================================================================
+# Graph export and snapshots
+# ======================================================================
 
-    n_docs = max(1, df["doc"].nunique())
+from .graph_snapshots import (  # noqa: E402,F401
+    generate_graph_snapshots,
+)
 
-    grouped = df.groupby("element")
-    records = []
-    desc_map = {}
+from .graph_export import (  # noqa: E402,F401
+    export_graph_snapshots,
+)
 
-    for el, sub in grouped:
-        count = len(sub)
-        doc_coverage = sub["doc"].nunique() / n_docs if n_docs > 0 else 0.0
-        mean_entropy = float(sub["entropy"].mean()) if "entropy" in sub else 0.0
-        mean_coherence = float(sub["coherence"].mean()) if "coherence" in sub else 0.0
-        mean_stability = float(sub["stability"].mean()) if "stability" in sub else 0.0
 
-        role = _categorize_role(mean_entropy, mean_coherence)
-        name = _generate_name(el, role)
-        desc = _generate_description(el, role, mean_entropy, mean_coherence, doc_coverage)
+# ======================================================================
+# Full export (PDF, ZIP)
+# ======================================================================
 
-        records.append({
-            "element": el,
-            "count": int(count),
-            "doc_coverage": float(doc_coverage),
-            "mean_entropy": round(mean_entropy, 6),
-            "mean_coherence": round(mean_coherence, 6),
-            "mean_stability": round(mean_stability, 6),
-            "role": role,
-        })
+from .hilbert_export import (  # noqa: E402,F401
+    export_summary_pdf,
+    export_zip,
+)
 
-        desc_map[el] = {
-            "id": el,
-            "name": name,
-            "role": role,
-            "summary": desc,
-            "metrics": {
-                "count": int(count),
-                "doc_coverage": float(doc_coverage),
-                "mean_entropy": float(mean_entropy),
-                "mean_coherence": float(mean_coherence),
-                "mean_stability": float(mean_stability),
-            },
-        }
+def run_full_export(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
+    """Produce both PDF and ZIP summaries."""
+    emit("log", {"stage": "export", "event": "start"})
+    export_summary_pdf(results_dir)
+    export_zip(results_dir)
+    emit("log", {"stage": "export", "event": "end"})
 
-    # Save intensity table (used by PDF + dashboards)
-    intensity_path = os.path.join(out_dir, "element_intensity.csv")
-    pd.DataFrame(records).sort_values("count", ascending=False).to_csv(
-        intensity_path, index=False
-    )
 
-    # Save descriptions JSON
-    desc_path = os.path.join(out_dir, "element_descriptions.json")
-    with open(desc_path, "w", encoding="utf-8") as f:
-        json.dump(desc_map, f, indent=2)
+# ======================================================================
+# Misinfo / epistemic signatures layer
+# ======================================================================
 
-    print(f"[elements] Wrote {desc_path} and {intensity_path}")
-    return desc_path
+from .signatures import (  # noqa: E402,F401
+    compute_signatures,
+)
+
+
+# ======================================================================
+# Public API
+# ======================================================================
+
+__all__ = [
+    # Emitter
+    "DEFAULT_EMIT",
+
+    # LSA
+    "build_lsa_field",
+
+    # Molecules
+    "run_molecule_stage",
+    "run_molecule_layer",
+    "build_molecules",
+    "aggregate_compounds",
+    "compute_molecule_stability",
+    "compute_molecule_temperature",
+    "export_molecule_summary",
+
+    # Fusion
+    "fuse_spans_to_elements",
+    "aggregate_compound_context",
+    "run_fusion_pipeline",
+
+    # Labels
+    "build_element_descriptions",
+
+    # Stability and visuals
+    "compute_signal_stability",
+    "plot_persistence_field",
+    "run_persistence_visuals",
+
+    # Graph views
+    "generate_graph_snapshots",
+    "export_graph_snapshots",
+
+    # Exports
+    "export_summary_pdf",
+    "export_zip",
+    "run_full_export",
+
+    # Misinfo layer
+    "compute_signatures",
+]
