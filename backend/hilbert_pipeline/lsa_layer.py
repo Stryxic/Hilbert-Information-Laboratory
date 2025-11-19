@@ -2,7 +2,7 @@
 # lsa_layer.py — Hilbert Information Chemistry Lab
 # Latent Semantic Analysis + Element Extraction Layer
 # =============================================================================
-# Version: 2025 Thesis-Aligned Pipeline (Multi-format, upgraded, hybrid elements)
+# Version: 2025 Thesis-Aligned Pipeline (Multi-format, upgraded)
 #
 # Responsibilities:
 #   - Ingest heterogeneous corpus files (PDF, LaTeX, code, plain text, HTML)
@@ -12,38 +12,22 @@
 #   - Compute an LSA (truncated SVD) spectral field
 #   - Emit a compact JSON-serialisable representation for downstream stages
 #
-# Public entrypoint:
-#   build_lsa_field(corpus_dir, emit=...) -> Dict[str, Any]
+# Public entrypoints:
+#   run_lsa_layer(corpus_dir: str | pathlib.Path, ...) -> Dict[str, Any]
+#   build_lsa_field(corpus_dir: str | pathlib.Path, emit, ...) -> Dict[str, Any]
 #
-# Returned dictionary (schema used by the orchestrator):
-#
+# Returned dictionary for build_lsa_field():
 #   {
-#       "elements": [
-#           { "element": str, "span_id": int },
-#           ...
-#       ],
-#       "element_metrics": [
-#           {
-#               "element": str,
-#               "index": int,
-#               "collection_freq": int,
-#               "document_freq": int,
-#               "mean_entropy": float,
-#               "mean_coherence": float,
-#           },
-#           ...
-#       ],
+#       "elements":        [ { "element": str, "index": int } ],
+#       "element_metrics": [ { "element": str, "index": int,
+#                              "collection_freq": int, "document_freq": int } ],
 #       "field": {
-#           "embeddings": np.ndarray (n_spans, k),
-#           "span_map": [ { "doc": str, "span_id": int, "text": str }, ... ],
-#           "vocab": [ str, ... ],
-#       },
+#           "embeddings":  np.ndarray shape (n_spans, k),
+#           "span_map":    [ { "doc": str, "span_id": int,
+#                              "text": str, "elements": [str, ...] } ],
+#           "vocab":       [ str, ... ],
+#       }
 #   }
-#
-# The orchestrator then:
-#   - Expands per-span rows into hilbert_elements.csv
-#   - Uses element_metrics for stability computation
-#
 # =============================================================================
 
 from __future__ import annotations
@@ -52,7 +36,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-from collections import Counter, defaultdict
+from collections import Counter
 
 import numpy as np
 
@@ -196,6 +180,7 @@ def extract_text_from_python(path: Path) -> str:
     for line in src.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
+            # drop leading '#', keep the comment text
             comment_lines.append(stripped.lstrip("#").strip())
 
     # Docstrings via a simple regex for triple-quoted strings
@@ -276,7 +261,8 @@ def read_and_clean(path: Path) -> str:
     kind = detect_file_kind(path)
     if kind == "pdf":
         raw = extract_text_from_pdf(path)
-        return strip_html(raw)  # PDFs sometimes carry HTML-ish text
+        # PDFs sometimes carry HTML-ish or layout noise
+        return strip_html(raw)
 
     if kind == "latex":
         try:
@@ -306,6 +292,7 @@ def read_and_clean(path: Path) -> str:
 
     if not raw:
         return ""
+    # very light normalisation for generic text
     raw = MULTI_WS_RE.sub(" ", raw)
     raw = MULTI_NL_RE.sub("\n", raw)
     return raw.strip()
@@ -388,7 +375,7 @@ def normalise_token(t: str) -> str:
 
 def extract_elements_from_text(text: str) -> List[str]:
     """
-    Extract noun-like "elements" from a span of text (hybrid strategy).
+    Extract noun-like "elements" from a span of text.
 
     Strategy:
       - If spaCy is available, use:
@@ -436,7 +423,7 @@ def compute_lsa_embeddings(
     spans: List[str],
     n_components: int = 128,
     max_vocab: int = 5000,
-):
+) -> Tuple[np.ndarray, List[str], Any]:
     """
     Compute LSA embeddings for a list of span texts.
 
@@ -475,7 +462,7 @@ def compute_lsa_embeddings(
 
 
 # =============================================================================
-# Core LSA field construction
+# Main entrypoint
 # =============================================================================
 
 
@@ -491,20 +478,25 @@ def run_lsa_layer(
       - Read files from corpus_dir (multi-format)
       - Apply format-specific cleaning (PDF, LaTeX, code, HTML, plain text)
       - Segment into spans using spaCy (or newline-based fallback)
-      - Compute LSA spectral field over spans using hybrid element tokenizer
-      - Build:
-          * span_map (doc, span_id, text)
-          * per-span element occurrences (element, span_id)
-          * per-element metrics: frequency, and simple entropy/coherence
+      - Extract elements per span
+      - Build TF-IDF over spans using element tokenizer
+      - Compute LSA spectral field
+      - Construct lightweight element registry and metrics
 
-    Returns
-    -------
-    dict with keys:
-      - "elements" (per-span occurrences)
-      - "element_metrics" (per-element statistics)
-      - "vocab"
-      - "embeddings"
-      - "span_map"
+    Returns a dict:
+      {
+        "elements":        [ { "element": e, "index": idx } ],
+        "element_metrics": [ { "element": e, "index": idx,
+                               "collection_freq": cf,
+                               "document_freq": df } ],
+        "vocab":           [ ... ],
+        "embeddings":      np.ndarray (n_spans, k),
+        "span_map":        [
+                              { "doc": ..., "span_id": int,
+                                "text": str, "elements": [str, ...] },
+                              ...
+                           ],
+      }
     """
     corpus_dir = Path(corpus_dir)
     if not corpus_dir.exists():
@@ -532,8 +524,20 @@ def run_lsa_layer(
                     continue
                 if not is_informative_span(s):
                     continue
+                elems = extract_elements_from_text(s)
+                if not elems:
+                    # keep spans even if element extraction fails; LSA may still
+                    # recover structure via neighbouring spans
+                    elems = []
                 spans.append(s)
-                span_map.append({"doc": f.name, "span_id": span_id, "text": s})
+                span_map.append(
+                    {
+                        "doc": f.name,
+                        "span_id": span_id,
+                        "text": s,
+                        "elements": elems,
+                    }
+                )
                 span_id += 1
         else:
             # Fallback: split on newlines
@@ -543,8 +547,18 @@ def run_lsa_layer(
                     continue
                 if not is_informative_span(s):
                     continue
+                elems = extract_elements_from_text(s)
+                if not elems:
+                    elems = []
                 spans.append(s)
-                span_map.append({"doc": f.name, "span_id": span_id, "text": s})
+                span_map.append(
+                    {
+                        "doc": f.name,
+                        "span_id": span_id,
+                        "text": s,
+                        "elements": elems,
+                    }
+                )
                 span_id += 1
 
     if not spans:
@@ -561,94 +575,45 @@ def run_lsa_layer(
         spans, n_components=n_components, max_vocab=max_vocab
     )
 
-    # If vocab is empty, we cannot build meaningful elements.
-    if len(vocab) == 0 or embeddings.shape[0] == 0:
-        print("[lsa] Empty vocab or embeddings; returning minimal field.")
-        return {
-            "elements": [],
-            "element_metrics": [],
-            "vocab": vocab,
-            "embeddings": embeddings,
-            "span_map": span_map,
-        }
-
-    # -------------------------------------------------------------------------
-    # Build per-span occurrences and per-element statistics
-    # -------------------------------------------------------------------------
-
+    # Build a minimal element registry and metrics.
     element_to_index: Dict[str, int] = {e: i for i, e in enumerate(vocab)}
 
-    cf_counter: Counter[str] = Counter()          # collection frequency
-    df_counter: Counter[str] = Counter()          # document (span) frequency
-    elem_to_spans: Dict[str, List[int]] = defaultdict(list)
-    occurrences: List[Dict[str, Any]] = []        # per-span rows for orchestrator
+    # Term frequencies (collection frequency) and document frequency by span.
+    cf_counter: Counter[str] = Counter()
+    df_counter: Counter[str] = Counter()
 
-    for sid, s in enumerate(spans):
-        elems = extract_elements_from_text(s)
+    # Use the same tokenizer logic we used in the vectorizer, but we
+    # already have per-span elements in span_map, so reuse them if possible.
+    for span_rec in span_map:
+        elems = span_rec.get("elements") or []
+        if not elems:
+            # fallback to on-the-fly extraction
+            elems = extract_elements_from_text(span_rec.get("text", ""))
         if not elems:
             continue
-
-        span_elems = set()
-        for e in elems:
-            if e not in element_to_index:
-                # filtered out by vectorizer (e.g. low df) – ignore
-                continue
-            cf_counter[e] += 1
-            span_elems.add(e)
-            elem_to_spans[e].append(sid)
-            occurrences.append({"element": e, "span_id": sid})
-
-        for e in span_elems:
+        cf_counter.update(elems)
+        for e in set(elems):
             df_counter[e] += 1
 
-    # -------------------------------------------------------------------------
-    # Per-element metrics, including simple entropy / coherence
-    # -------------------------------------------------------------------------
-
+    elements: List[Dict[str, Any]] = []
     element_metrics: List[Dict[str, Any]] = []
 
     for e, idx in element_to_index.items():
-        spans_idx = elem_to_spans.get(e, [])
         cf = int(cf_counter.get(e, 0))
         df = int(df_counter.get(e, 0))
-
-        if spans_idx:
-            embs = embeddings[spans_idx]
-            # distance-based dispersion
-            mu = embs.mean(axis=0, keepdims=True)
-            dists = np.linalg.norm(embs - mu, axis=1)
-
-            # Entropy over normalised distances (higher = more dispersed)
-            if np.any(dists > 0):
-                p = dists / (dists.sum() + 1e-12)
-                H = float(-np.sum(p * np.log(p + 1e-12)))
-            else:
-                H = 0.0
-
-            # Coherence as exp(-variance) of embeddings (higher = more coherent)
-            var = float(np.var(embs, axis=0).mean())
-            C = float(np.exp(-var))
-        else:
-            H = 0.0
-            C = 0.0
-
+        elements.append({"element": e, "index": idx})
         element_metrics.append(
             {
                 "element": e,
                 "index": idx,
                 "collection_freq": cf,
                 "document_freq": df,
-                "mean_entropy": H,
-                "mean_coherence": C,
             }
         )
 
     return {
-        # per-span occurrences (orchestrator will join with span_map and embeddings)
-        "elements": occurrences,
-        # per-element aggregated metrics (used by stability layer)
+        "elements": elements,
         "element_metrics": element_metrics,
-        # field-level structures
         "vocab": vocab,
         "embeddings": embeddings,
         "span_map": span_map,
@@ -678,7 +643,7 @@ def build_lsa_field(
             "field": {
                 "embeddings": ndarray,
                 "span_map": [...],
-                "vocab": [...]
+                "vocab": [...],
             }
         }
     """
@@ -716,16 +681,23 @@ def build_lsa_field(
 # CLI hook (optional)
 # =============================================================================
 
-
 if __name__ == "__main__":  # pragma: no cover
     import argparse
 
     ap = argparse.ArgumentParser(description="Hilbert LSA Layer (multi-format)")
     ap.add_argument("--corpus", required=True, help="Folder of corpus files.")
     ap.add_argument("--out", required=True, help="Output JSON path.")
+    ap.add_argument("--k", type=int, default=128, help="LSA dimensionality.")
+    ap.add_argument(
+        "--max-vocab", type=int, default=5000, help="Max vocab size."
+    )
     args = ap.parse_args()
 
-    res = run_lsa_layer(args.corpus)
+    res = run_lsa_layer(
+        args.corpus,
+        n_components=args.k,
+        max_vocab=args.max_vocab,
+    )
 
     out: Dict[str, Any] = dict(res)
     emb = out.get("embeddings")

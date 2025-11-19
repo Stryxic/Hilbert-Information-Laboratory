@@ -1,6 +1,17 @@
-# =====================================================================
-# Hilbert Orchestrator 2.2 - Fully Patched Version
-# =====================================================================
+"""
+Hilbert Orchestrator 3.0
+
+Declarative, dialectical orchestration of the Hilbert information pipeline.
+
+- Stages are defined in a single declarative table (STAGE_TABLE).
+- Each stage is a node in a dialectical graph, with explicit dependencies,
+  support edges, and challenge edges.
+- The orchestrator executes stages in order, respecting dependencies and
+  surfacing a rich run summary that the frontend can render.
+
+This file is intentionally self-contained: the only assumptions about other
+modules are the public functions re-exported by `hilbert_pipeline.__init__`.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +24,9 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Pipeline imports (all via hilbert_pipeline public API)
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 try:
     from hilbert_pipeline import (
@@ -53,26 +64,33 @@ try:
         # Element LM
         run_element_lm_stage,
     )
-except Exception as exc:
+except Exception as exc:  # very defensive import
     raise RuntimeError(f"[orchestrator] Failed to import hilbert_pipeline: {exc}") from exc
 
 
 EmitFn = Callable[[str, Dict[str, Any]], None]
 
 
-# =====================================================================
-# Settings and state classes
-# =====================================================================
+# -----------------------------------------------------------------------------
+# Settings and context objects
+# -----------------------------------------------------------------------------
 
 @dataclass
 class PipelineSettings:
+    """
+    User-tunable knobs.
+
+    Keep this conservative - anything heavy should be configured per stage.
+    """
     use_native: bool = True
     max_docs: Optional[int] = None
     random_seed: int = 13
+    # Future: thermodynamic controls, misinfo sensitivity, etc.
 
 
 @dataclass
 class StageState:
+    """Runtime state for a single stage execution."""
     key: str
     label: str
     status: Literal["pending", "running", "ok", "skipped", "failed"] = "pending"
@@ -90,12 +108,25 @@ class StageState:
 
 @dataclass
 class StageSpec:
+    """
+    Declarative description of a pipeline stage.
+
+    dialectic_role:
+        - "evidence"  - generates or sharpens observations
+        - "structure" - reshapes observations into higher-order structure
+        - "thermo"    - computes thermodynamic / stability metrics
+        - "epistemic" - evaluates truth, intent, misinfo signatures
+        - "visual"    - builds views on the structure
+        - "export"    - packages results
+    """
     key: str
     order: float
     label: str
     func: Optional[Callable[["PipelineContext"], None]]
     required: bool = True
-    dialectic_role: Literal["evidence", "structure", "thermo", "epistemic", "visual", "export"] = "structure"
+    dialectic_role: Literal[
+        "evidence", "structure", "thermo", "epistemic", "visual", "export"
+    ] = "structure"
     depends_on: List[str] = field(default_factory=list)
     supports: List[str] = field(default_factory=list)
     challenges: List[str] = field(default_factory=list)
@@ -105,32 +136,36 @@ class StageSpec:
 
 @dataclass
 class PipelineContext:
+    """
+    Shared context for a single run.
+
+    The orchestrator deals with directories, paths and coarse messages.
+    Internal math lives inside hilbert_pipeline modules.
+    """
     corpus_dir: str
     results_dir: str
     settings: PipelineSettings = field(default_factory=PipelineSettings)
     emit: EmitFn = DEFAULT_EMIT
 
+    # Computed during the run
     run_id: str = field(default_factory=lambda: str(int(time.time())))
     stages: Dict[str, StageState] = field(default_factory=dict)
     artifacts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     extras: Dict[str, Any] = field(default_factory=dict)
 
-    # -----------------------------------------------------
-    # Logging
-    # -----------------------------------------------------
     def log(self, level: str, msg: str, **fields: Any) -> None:
         payload = {"level": level, "msg": msg, "ts": time.time()}
         payload.update(fields)
         try:
             self.emit("log", payload)
         except Exception:
+            # Fallback to stdout if user supplied an emit that fails
             print(f"[{level}] {msg} {fields}")
 
-    # -----------------------------------------------------
-    # Stage lifecycle
-    # -----------------------------------------------------
+    # --- stage lifecycle -----------------------------------------------------
+
     def begin_stage(self, spec: StageSpec) -> StageState:
-        state = self.stages.get(spec.key) or StageState(spec.key, spec.label)
+        state = self.stages.get(spec.key) or StageState(key=spec.key, label=spec.label)
         state.status = "running"
         state.start_ts = time.time()
         self.stages[spec.key] = state
@@ -138,60 +173,59 @@ class PipelineContext:
         return state
 
     def end_stage_ok(self, spec: StageSpec, meta: Optional[Dict[str, Any]] = None) -> None:
-        st = self.stages[spec.key]
-        st.status = "ok"
-        st.end_ts = time.time()
+        state = self.stages[spec.key]
+        state.status = "ok"
+        state.end_ts = time.time()
         if meta:
-            st.meta.update(meta)
-        self.log("info", f"{spec.label} - ok", stage=spec.key, duration=st.duration)
+            state.meta.update(meta)
+        self.log("info", f"{spec.label} - ok", stage=spec.key, duration=state.duration)
 
     def end_stage_skipped(self, spec: StageSpec, reason: str) -> None:
-        st = self.stages.get(spec.key) or StageState(spec.key, spec.label)
-        st.status = "skipped"
-        st.error = reason
-        st.start_ts = st.start_ts or time.time()
-        st.end_ts = time.time()
-        self.stages[spec.key] = st
+        state = self.stages.get(spec.key) or StageState(key=spec.key, label=spec.label)
+        state.status = "skipped"
+        state.error = reason
+        state.start_ts = state.start_ts or time.time()
+        state.end_ts = time.time()
+        self.stages[spec.key] = state
         self.log("warn", f"{spec.label} - skipped: {reason}", stage=spec.key)
 
     def end_stage_failed(self, spec: StageSpec, error: str) -> None:
-        st = self.stages[spec.key]
-        st.status = "failed"
-        st.error = error
-        st.end_ts = time.time()
+        state = self.stages[spec.key]
+        state.status = "failed"
+        state.error = error
+        state.end_ts = time.time()
         self.log("error", f"{spec.label} - failed: {error}", stage=spec.key)
 
-    # -----------------------------------------------------
-    # Artifact tracking
-    # -----------------------------------------------------
-    def add_artifact(self, name: str, kind: str, **meta: Any) -> None:
-        self.artifacts[name] = {
-            "kind": kind,
-            "path": os.path.join(self.results_dir, name),
-            **meta,
-        }
+    # --- artifact tracking ---------------------------------------------------
 
-    # -----------------------------------------------------
-    # Dialectic graph
-    # -----------------------------------------------------
+    def add_artifact(self, name: str, kind: str, **meta: Any) -> None:
+        path = os.path.join(self.results_dir, name)
+        self.artifacts[name] = {"kind": kind, "path": path, **meta}
+
+    # --- dialectical graph export -------------------------------------------
+
     def dialectic_graph(self, specs: List[StageSpec]) -> Dict[str, Any]:
+        """Return a JSON-serialisable dialectic graph describing this run."""
         nodes = []
         edges = []
+
         for spec in specs:
             st = self.stages.get(spec.key)
-            nodes.append({
-                "id": spec.key,
-                "label": spec.label,
-                "role": spec.dialectic_role,
-                "status": getattr(st, "status", "pending"),
-                "duration": getattr(st, "duration", None),
-                "required": spec.required,
-                "produces": spec.produces,
-                "consumes": spec.consumes,
-            })
+            nodes.append(
+                {
+                    "id": spec.key,
+                    "label": spec.label,
+                    "role": spec.dialectic_role,
+                    "status": getattr(st, "status", "pending"),
+                    "duration": getattr(st, "duration", None),
+                    "required": spec.required,
+                    "produces": spec.produces,
+                    "consumes": spec.consumes,
+                }
+            )
 
-            for d in spec.depends_on:
-                edges.append({"source": d, "target": spec.key, "type": "depends_on"})
+            for dep in spec.depends_on:
+                edges.append({"source": dep, "target": spec.key, "type": "depends_on"})
             for s in spec.supports:
                 edges.append({"source": spec.key, "target": s, "type": "supports"})
             for c in spec.challenges:
@@ -199,9 +233,8 @@ class PipelineContext:
 
         return {"nodes": nodes, "edges": edges}
 
-    # -----------------------------------------------------
-    # Run summary
-    # -----------------------------------------------------
+    # --- run summary --------------------------------------------------------
+
     def run_summary(self, specs: List[StageSpec]) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -209,205 +242,198 @@ class PipelineContext:
             "results_dir": self.results_dir,
             "settings": self.settings.__dict__,
             "stages": {
-                k: {
+                key: {
                     "label": st.label,
                     "status": st.status,
                     "error": st.error,
                     "duration": st.duration,
                     "meta": st.meta,
                 }
-                for k, st in self.stages.items()
+                for key, st in self.stages.items()
             },
             "artifacts": self.artifacts,
             "dialectic_graph": self.dialectic_graph(specs),
         }
 
 
-# =====================================================================
-# Stage implementations
-# =====================================================================
+# -----------------------------------------------------------------------------
+# Stage implementations (wrappers around hilbert_pipeline functions)
+# -----------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# 1. LSA
-# ---------------------------------------------------------------------
 def _stage_lsa(ctx: PipelineContext) -> None:
+    """
+    Run LSA, then write hilbert_elements.csv in a stability-compatible format.
+
+    We:
+      - call build_lsa_field() to compute the spectral field
+      - store the raw result in ctx.extras["lsa_result"]
+      - export:
+          * hilbert_elements.csv   (element-level table)
+          * lsa_field.json         (flattened LSA field: embeddings + span_map)
+    """
     res = build_lsa_field(ctx.corpus_dir, emit=ctx.emit) or {}
     ctx.extras["lsa_result"] = res
 
     elements = res.get("elements", []) or []
     metrics = res.get("element_metrics", []) or []
+
     field = res.get("field", {}) or {}
-
-    span_map = field.get("span_map", [])
+    span_map = field.get("span_map", []) or []
     embeddings = field.get("embeddings")
-    vocab = field.get("vocab")
 
-    # Ensure embeddings are JSON-safe
+    # Convert ndarray embeddings to list-of-lists for JSON, but keep ndarray for internal use
     if isinstance(embeddings, np.ndarray):
-        embeddings = embeddings.tolist()
+        emb_array = embeddings
+        emb_for_json = embeddings.tolist()
+    else:
+        emb_array = np.asarray(embeddings or [], dtype=float)
+        emb_for_json = embeddings
 
-    # Build hilbert_elements.csv
-    rows = []
+    # ---------------------------------------------
+    # Build element-level rows
+    # ---------------------------------------------
+    element_rows = []
     for rec in elements:
         el = rec.get("element")
-        sid = rec.get("span_id")
-        doc, text = None, None
+        idx = rec.get("index")
+        element_rows.append(
+            {
+                "element": el,
+                "index": idx,
+                # we keep span linkage separate via span_map / fusion;
+                # these columns remain for backward compatibility
+                "span_id": -1,
+                "doc": None,
+                "text": None,
+            }
+        )
 
-        if sid is not None and sid < len(span_map):
-            sp = span_map[sid]
-            doc = sp.get("doc")
-            text = sp.get("text")
+    elements_df = pd.DataFrame(element_rows)
 
-        row = {
-            "element": el,
-            "span_id": sid,
-            "doc": doc,
-            "text": text,
-        }
+    # ---------------------------------------------
+    # Build metrics dataframe
+    # ---------------------------------------------
+    metrics_df = pd.DataFrame(metrics)
 
-        rows.append(row)
+    # Standardise names if mean_* present
+    if "mean_entropy" in metrics_df.columns and "entropy" not in metrics_df.columns:
+        metrics_df["entropy"] = metrics_df["mean_entropy"]
+    if "mean_coherence" in metrics_df.columns and "coherence" not in metrics_df.columns:
+        metrics_df["coherence"] = metrics_df["mean_coherence"]
 
-    df = pd.DataFrame(rows)
-    mdf = pd.DataFrame(metrics)
+    # ---------------------------------------------
+    # Merge metrics into element rows
+    # ---------------------------------------------
+    if not metrics_df.empty:
+        merged = elements_df.merge(metrics_df, on=["element", "index"], how="left")
+    else:
+        merged = elements_df
 
-    # Standard metric names
-    if "mean_entropy" in mdf.columns:
-        mdf["entropy"] = mdf["mean_entropy"]
-    if "mean_coherence" in mdf.columns:
-        mdf["coherence"] = mdf["mean_coherence"]
-
-    merged = df.merge(mdf, on="element", how="left")
-
-    out_csv = os.path.join(ctx.results_dir, "hilbert_elements.csv")
-    merged.to_csv(out_csv, index=False)
+    # ---------------------------------------------
+    # Write hilbert_elements.csv
+    # ---------------------------------------------
+    elements_path = os.path.join(ctx.results_dir, "hilbert_elements.csv")
+    merged.to_csv(elements_path, index=False)
     ctx.add_artifact("hilbert_elements.csv", "elements")
 
-    # Write LSA field
-    lsa_flat = {"embeddings": embeddings, "span_map": span_map, "vocab": vocab}
+    # ---------------------------------------------
+    # Write LSA field (flat for compatibility)
+    # ---------------------------------------------
+    lsa_flat = {
+        "embeddings": emb_array.tolist() if isinstance(emb_array, np.ndarray) else emb_for_json,
+        "span_map": span_map,
+        "vocab": field.get("vocab"),
+    }
     with open(os.path.join(ctx.results_dir, "lsa_field.json"), "w", encoding="utf-8") as f:
         json.dump(lsa_flat, f, indent=2)
-    ctx.add_artifact("lsa_field.json", "lsa")
+
+    ctx.add_artifact("lsa_field.json", "lsa-field")
 
 
-# ---------------------------------------------------------------------
-# 2. Graph edges (spectral centroid similarity)
-# ---------------------------------------------------------------------
-def _stage_graph_edges(ctx: PipelineContext) -> None:
-    lsa = ctx.extras.get("lsa_result") or {}
-    field = lsa.get("field", {})
-    elements = lsa.get("elements", [])
-
-    span_map = field.get("span_map", [])
-    embeddings = field.get("embeddings", [])
-    embeddings = np.asarray(embeddings, dtype=float)
-
-    if embeddings.size == 0:
-        ctx.log("warn", "[graph] no embeddings; skipping")
-        return
-
-    # map: span_id → embedding index
-    span_index = {}
-    for i, sp in enumerate(span_map):
-        sid = sp.get("span_id", i)
-        span_index[int(sid)] = i
-
-    # build centroid per element
-    from collections import defaultdict
-    bucket = defaultdict(list)
-
-    for rec in elements:
-        el = str(rec.get("element"))
-        sid = rec.get("span_id")
-        if el is None or sid is None:
-            continue
-        if sid in span_index:
-            bucket[el].append(span_index[sid])
-
-    centroids = {}
-    for el, idxs in bucket.items():
-        centroids[el] = embeddings[idxs].mean(axis=0)
-
-    if not centroids:
-        ctx.log("warn", "[graph] no centroids; skipping")
-        return
-
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    keys = list(centroids.keys())
-    vecs = np.stack([centroids[k] for k in keys])
-    S = cosine_similarity(vecs)
-
-    rows = []
-    top_k = 8
-    min_sim = 0.35
-
-    for i, el in enumerate(keys):
-        sims = S[i]
-        idx_sorted = np.argsort(sims)[::-1]
-        for j in idx_sorted[:top_k]:
-            if sims[j] < min_sim:
-                continue
-            rows.append({
-                "source": el,
-                "target": keys[j],
-                "weight": float(sims[j]),
-            })
-
-    df = pd.DataFrame(rows)
-    out = os.path.join(ctx.results_dir, "edges.csv")
-    df.to_csv(out, index=False)
-    ctx.add_artifact("edges.csv", "edges")
-
-
-# ---------------------------------------------------------------------
-# 3. Molecules
-# ---------------------------------------------------------------------
 def _stage_molecules(ctx: PipelineContext) -> None:
+    """
+    Molecule construction & compounds.
+
+    Uses run_molecule_layer(results_dir, emit) from hilbert_pipeline.
+
+    Produces:
+      - molecules.csv
+      - informational_compounds.json (handled inside run_molecule_layer)
+    """
     mol_df, comp_df = run_molecule_layer(ctx.results_dir, emit=ctx.emit)
 
+    # Molecule table
     if isinstance(mol_df, pd.DataFrame) and not mol_df.empty:
         path = os.path.join(ctx.results_dir, "molecules.csv")
-        mol_df.to_csv(path, index=False)
-        ctx.add_artifact("molecules.csv", "molecule-table")
+        try:
+            mol_df.to_csv(path, index=False)
+            ctx.add_artifact("molecules.csv", "molecule-table")
+        except Exception as exc:
+            ctx.log("warn", f"Failed to write molecules.csv: {exc}")
+
+    # Compound JSON – produced by the molecule layer
+    comp_path = os.path.join(ctx.results_dir, "informational_compounds.json")
+    if os.path.exists(comp_path):
+        ctx.add_artifact("informational_compounds.json", "informational-compounds")
 
 
-# ---------------------------------------------------------------------
-# 4. Fusion layer
-# ---------------------------------------------------------------------
 def _stage_fusion(ctx: PipelineContext) -> None:
+    """
+    Span → element fusion and compound context enrichment.
+
+    Delegates to hilbert_pipeline.run_fusion_pipeline(results_dir, emit).
+    """
     run_fusion_pipeline(ctx.results_dir, emit=ctx.emit)
 
 
-# ---------------------------------------------------------------------
-# 5. Stability
-# ---------------------------------------------------------------------
 def _stage_stability(ctx: PipelineContext) -> None:
+    """
+    Compute signal stability metrics over elements.
+
+    Uses compute_signal_stability(elements_csv, out_csv, mode, emit).
+    If entropy/coherence fields are missing, the stability module will log
+    a warning and abort gracefully.
+    """
     elements_csv = os.path.join(ctx.results_dir, "hilbert_elements.csv")
     out_csv = os.path.join(ctx.results_dir, "signal_stability.csv")
-
     compute_signal_stability(
         elements_csv=elements_csv,
         out_csv=out_csv,
         mode="classic",
         emit=ctx.emit,
     )
-    ctx.add_artifact("signal_stability.csv", "signal-stability")
+    # The stability module will decide whether it actually wrote the file.
+    if os.path.exists(out_csv):
+        ctx.add_artifact("signal_stability.csv", "signal-stability")
 
 
-# ---------------------------------------------------------------------
-# 6. Persistence
-# ---------------------------------------------------------------------
 def _stage_persistence(ctx: PipelineContext) -> None:
+    """
+    Persistence and stability visuals.
+
+    Delegates to run_persistence_visuals(results_dir, emit) which handles:
+      - persistence_field.png
+      - stability_scatter.png
+      - stability_by_doc.png
+    """
     run_persistence_visuals(ctx.results_dir, emit=ctx.emit)
-    ctx.add_artifact("persistence_field.png", "persistence")
-    ctx.add_artifact("stability_scatter.png", "stability-scatter")
-    ctx.add_artifact("stability_by_doc.png", "stability-by-doc")
+
+    for fname, kind in [
+        ("persistence_field.png", "persistence-field"),
+        ("stability_scatter.png", "stability-scatter"),
+        ("stability_by_doc.png", "stability-by-doc"),
+    ]:
+        path = os.path.join(ctx.results_dir, fname)
+        if os.path.exists(path):
+            ctx.add_artifact(fname, kind)
 
 
-# ---------------------------------------------------------------------
-# 7. Element Labels
-# ---------------------------------------------------------------------
 def _stage_element_labels(ctx: PipelineContext) -> None:
+    """
+    Build element labels and human-readable descriptions.
+
+    We pass the span_map from the LSA layer (if available) for nicer contexts.
+    """
     spans = (ctx.extras.get("lsa_result") or {}).get("field", {}).get("span_map", [])
     build_element_descriptions(
         elements_csv=os.path.join(ctx.results_dir, "hilbert_elements.csv"),
@@ -418,193 +444,84 @@ def _stage_element_labels(ctx: PipelineContext) -> None:
     ctx.add_artifact("element_intensity.csv", "element-intensity")
 
 
-# ---------------------------------------------------------------------
-# 8. Epistemic signatures
-# ---------------------------------------------------------------------
 def _stage_signatures(ctx: PipelineContext) -> None:
+    """
+    Compute epistemic / misinfo signatures.
+
+    The underlying module is tolerant of missing labels and will no-op gracefully.
+    """
     out_path = compute_signatures(ctx.results_dir, emit=ctx.emit)
     if out_path:
         ctx.add_artifact(os.path.basename(out_path), "epistemic-signatures")
 
 
-# ---------------------------------------------------------------------
-# 9. Graph snapshots (FULL PATCHED VERSION)
-# ---------------------------------------------------------------------
 def _stage_graph_snapshots(ctx: PipelineContext) -> None:
-    from collections import defaultdict
+    """
+    Generate graph snapshots.
 
-    results = ctx.results_dir
-    elements_csv = os.path.join(results, "hilbert_elements.csv")
-    edges_csv = os.path.join(results, "edges.csv")
-    molecules_csv = os.path.join(results, "molecules.csv")
-    fusion_csv = os.path.join(results, "span_element_fusion.csv")
-    labels_csv = os.path.join(results, "epistemic_labels.csv")
-
-    # Required files
-    if not os.path.exists(elements_csv):
-        ctx.log("warn", "[graph] missing hilbert_elements.csv")
-        return
-    if not os.path.exists(edges_csv):
-        ctx.log("warn", "[graph] missing edges.csv")
-        return
-
+    Relies on the hilbert_pipeline.graph_snapshots.generate_graph_snapshots
+    implementation, which reads hilbert_elements.csv / edges.csv / molecules.csv
+    from results_dir and writes PNGs (graph_*.png) into results_dir.
+    """
     try:
-        elements_df = pd.read_csv(elements_csv)
-    except Exception as exc:
-        ctx.log("warn", f"[graph] failed reading hilbert_elements: {exc}")
-        return
-
-    try:
-        edges_df = pd.read_csv(edges_csv)
-    except Exception as exc:
-        ctx.log("warn", f"[graph] failed reading edges.csv: {exc}")
-        return
-
-    # Optional molecules
-    molecule_df = pd.DataFrame()
-    if os.path.exists(molecules_csv):
-        try:
-            molecule_df = pd.read_csv(molecules_csv)
-        except Exception as exc:
-            ctx.log("warn", f"[graph] failed reading molecules.csv: {exc}")
-
-    # Optional fusion
-    fusion_df = None
-    if os.path.exists(fusion_csv):
-        try:
-            fusion_df = pd.read_csv(fusion_csv)
-        except Exception as exc:
-            ctx.log("warn", f"[graph] failed reading fusion CSV: {exc}")
-
-    # Optional label map
-    label_map = {}
-    if os.path.exists(labels_csv):
-        try:
-            ldf = pd.read_csv(labels_csv)
-            if {"element", "label"}.issubset(ldf.columns):
-                for _, r in ldf.iterrows():
-                    label_map[str(r["element"])] = str(r["label"])
-        except Exception as exc:
-            ctx.log("warn", f"[graph] failed reading labels: {exc}")
-
-    # -----------------------------------------------------
-    # Enriched span mapping
-    # -----------------------------------------------------
-    element_spans = defaultdict(lambda: {
-        "span_ids": [],
-        "span_texts": [],
-        "documents": set(),
-        "doc_freq": defaultdict(int),
-        "entropy_values": [],
-        "coherence_values": [],
-        "labels": set(),
-    })
-
-    # Extract from LSA span_map
-    span_map_raw = (ctx.extras.get("lsa_result") or {}).get("field", {}).get("span_map", [])
-    span_text_map = {}
-    for rec in span_map_raw:
-        doc = rec.get("doc")
-        sid_raw = rec.get("span_id", 0)
-        sid = f"{doc}_{sid_raw}"
-        span_text_map[sid] = rec.get("text", "")
-
-    # Fusion correlations
-    if fusion_df is not None and {"doc", "span_id", "element"}.issubset(fusion_df.columns):
-        for _, row in fusion_df.iterrows():
-            el = str(row["element"])
-            doc = str(row["doc"])
-            sid = f"{doc}_{row['span_id']}"
-
-            entry = element_spans[el]
-            entry["span_ids"].append(sid)
-            entry["documents"].add(doc)
-            entry["doc_freq"][doc] += 1
-            entry["span_texts"].append(span_text_map.get(sid, ""))
-
-    # Merge entropy/coherence/labels from elements_df
-    for _, row in elements_df.iterrows():
-        el = str(row.get("element"))
-        if el not in element_spans:
-            continue
-
-        if "entropy" in row and not pd.isna(row["entropy"]):
-            element_spans[el]["entropy_values"].append(row["entropy"])
-
-        if "coherence" in row and not pd.isna(row["coherence"]):
-            element_spans[el]["coherence_values"].append(row["coherence"])
-
-        if el in label_map:
-            element_spans[el]["labels"].add(label_map[el])
-
-    # -----------------------------------------------------
-    # Final JSON-safe enriched structure
-    # -----------------------------------------------------
-    enriched = {}
-    for el, vals in element_spans.items():
-        enriched[el] = {
-            "span_ids": vals["span_ids"],
-            "span_texts": vals["span_texts"],
-            "documents": list(vals["documents"]),
-            "doc_freq": dict(vals["doc_freq"]),
-            "avg_entropy": float(np.mean(vals["entropy_values"])) if vals["entropy_values"] else None,
-            "avg_coherence": float(np.mean(vals["coherence_values"])) if vals["coherence_values"] else None,
-            "labels": list(vals["labels"]),
-        }
-
-    # Write enriched maps
-    try:
-        path_full = os.path.join(results, "element_span_enriched.json")
-        with open(path_full, "w", encoding="utf-8") as f:
-            json.dump(enriched, f, indent=2)
-        ctx.add_artifact("element_span_enriched.json", "span-enriched")
-
-        path_simple = os.path.join(results, "element_span_map.json")
-        with open(path_simple, "w", encoding="utf-8") as f:
-            json.dump({el: v["span_ids"] for el, v in enriched.items()}, f, indent=2)
-        ctx.add_artifact("element_span_map.json", "span-map")
-    except Exception as exc:
-        ctx.log("warn", f"[graph] failed writing span maps: {exc}")
-
-    # -----------------------------------------------------
-    # Generate graph snapshots
-    # -----------------------------------------------------
-    out_dir = os.path.join(results, "graph_snapshots")
-    os.makedirs(out_dir, exist_ok=True)
-
-    try:
-        # Correct patched call signature
-        generate_graph_snapshots(
-            results_dir=out_dir,
-            emit=ctx.emit,
-        )
-        ctx.add_artifact("graph_snapshots", "graph-snapshots")
+        generate_graph_snapshots(ctx.results_dir, emit=ctx.emit)
+        # The underlying module writes graph_*.png; we register the directory as a logical artifact.
+        ctx.add_artifact("graph_snapshots", "graph-snapshots", artifact_kind="directory")
     except Exception as exc:
         ctx.log("error", f"[graph] Snapshot generation failed: {exc}")
 
 
-# ---------------------------------------------------------------------
-# 10. Graph export
-# ---------------------------------------------------------------------
 def _stage_graph_export(ctx: PipelineContext) -> None:
+    """
+    Legacy graph export (DOT / PNG variants).
+
+    Delegates to export_graph_snapshots(results_dir, emit).
+    """
     export_graph_snapshots(ctx.results_dir, emit=ctx.emit)
-    ctx.add_artifact("graph_export", "graph-export")
+    ctx.add_artifact("graph_export", "graph-export", artifact_kind="directory")
 
 
-# ---------------------------------------------------------------------
-# 11. Full export
-# ---------------------------------------------------------------------
+def _stage_element_lm(ctx: PipelineContext) -> None:
+    """
+    Train the element-level language model on span-element sequences.
+
+    The training code will no-op gracefully if span_element_fusion.csv is missing
+    or underspecified.
+    """
+    run_element_lm_stage(ctx.results_dir, emit=ctx.emit)
+
+    # Register typical LM artifacts if they exist
+    for fname, kind in [
+        ("element_lm.pt", "element-lm"),
+        ("element_vocab.json", "element-vocab"),
+    ]:
+        path = os.path.join(ctx.results_dir, fname)
+        if os.path.exists(path):
+            ctx.add_artifact(fname, kind)
+
+
 def _stage_full_export(ctx: PipelineContext) -> None:
+    """
+    Full export: summary PDF + ZIP bundle.
+
+    Delegates to run_full_export(results_dir, emit).
+    """
     run_full_export(ctx.results_dir, emit=ctx.emit)
-    ctx.add_artifact("hilbert_summary.pdf", "summary")
-    ctx.add_artifact("hilbert_run.zip", "archive")
+
+    for fname, kind in [
+        ("hilbert_summary.pdf", "summary-pdf"),
+        ("hilbert_run.zip", "archive-zip"),
+    ]:
+        path = os.path.join(ctx.results_dir, fname)
+        if os.path.exists(path):
+            ctx.add_artifact(fname, kind)
 
 
-# =====================================================================
-# Declarative Stage Table
-# =====================================================================
+# -----------------------------------------------------------------------------
+# Declarative stage table - dialectical graph definition
+# -----------------------------------------------------------------------------
 
-STAGE_TABLE = [
+STAGE_TABLE: List[StageSpec] = [
     StageSpec(
         key="lsa_field",
         order=1.0,
@@ -612,20 +529,8 @@ STAGE_TABLE = [
         func=_stage_lsa,
         required=True,
         dialectic_role="evidence",
-        produces=["lsa_field.json"],
+        produces=["lsa_field.json", "hilbert_elements.csv"],
     ),
-
-    StageSpec(
-        key="graph_edges",
-        order=1.5,
-        label="[1.5] Element-element graph",
-        func=_stage_graph_edges,
-        required=False,
-        dialectic_role="structure",
-        depends_on=["lsa_field"],
-        produces=["edges.csv"],
-    ),
-
     StageSpec(
         key="molecules",
         order=2.0,
@@ -633,12 +538,11 @@ STAGE_TABLE = [
         func=_stage_molecules,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field", "graph_edges"],
+        depends_on=["lsa_field"],
         consumes=["hilbert_elements.csv"],
         produces=["molecules.csv", "informational_compounds.json"],
         supports=["graph_snapshots"],
     ),
-
     StageSpec(
         key="fusion",
         order=3.0,
@@ -646,11 +550,10 @@ STAGE_TABLE = [
         func=_stage_fusion,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field"],
+        depends_on=["lsa_field", "molecules"],
         consumes=["hilbert_elements.csv"],
-        produces=["compound_contexts.json"],
+        produces=["span_element_fusion.csv", "compound_contexts.json"],
     ),
-
     StageSpec(
         key="stability_metrics",
         order=4.0,
@@ -663,7 +566,6 @@ STAGE_TABLE = [
         produces=["signal_stability.csv"],
         supports=["persistence_visuals", "epistemic_signatures"],
     ),
-
     StageSpec(
         key="persistence_visuals",
         order=5.0,
@@ -673,9 +575,12 @@ STAGE_TABLE = [
         dialectic_role="visual",
         depends_on=["stability_metrics"],
         consumes=["signal_stability.csv"],
-        produces=["persistence_field.png", "stability_scatter.png", "stability_by_doc.png"],
+        produces=[
+            "persistence_field.png",
+            "stability_scatter.png",
+            "stability_by_doc.png",
+        ],
     ),
-
     StageSpec(
         key="element_labels",
         order=6.0,
@@ -688,7 +593,6 @@ STAGE_TABLE = [
         produces=["element_descriptions.json", "element_intensity.csv"],
         supports=["epistemic_signatures"],
     ),
-
     StageSpec(
         key="epistemic_signatures",
         order=6.5,
@@ -699,20 +603,19 @@ STAGE_TABLE = [
         depends_on=["element_labels", "stability_metrics"],
         consumes=["hilbert_elements.csv", "signal_stability.csv"],
         produces=["epistemic_signatures.json"],
+        challenges=["raw_corpus"],  # conceptual node only
     ),
-
     StageSpec(
         key="element_lm",
         order=6.8,
         label="[6.8] Element Language Model",
-        func=lambda ctx: run_element_lm_stage(ctx.results_dir, emit=ctx.emit),
+        func=_stage_element_lm,
         required=False,
         dialectic_role="epistemic",
         depends_on=["fusion"],
         consumes=["hilbert_elements.csv", "span_element_fusion.csv"],
         produces=["element_lm.pt", "element_vocab.json"],
     ),
-
     StageSpec(
         key="graph_snapshots",
         order=7.0,
@@ -723,7 +626,6 @@ STAGE_TABLE = [
         depends_on=["molecules"],
         produces=["graph_snapshots"],
     ),
-
     StageSpec(
         key="graph_export",
         order=7.5,
@@ -734,7 +636,6 @@ STAGE_TABLE = [
         depends_on=["graph_snapshots"],
         produces=["graph_export"],
     ),
-
     StageSpec(
         key="export_all",
         order=8.0,
@@ -743,13 +644,15 @@ STAGE_TABLE = [
         required=False,
         dialectic_role="export",
         depends_on=["element_labels"],
+        supports=["epistemic_signatures"],
         produces=["hilbert_summary.pdf", "hilbert_run.zip"],
     ),
 ]
 
-# =====================================================================
-# Execution Engine
-# =====================================================================
+
+# -----------------------------------------------------------------------------
+# Execution engine
+# -----------------------------------------------------------------------------
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -761,12 +664,16 @@ def run_pipeline(
     settings: Optional[PipelineSettings] = None,
     emit: Optional[EmitFn] = None,
 ) -> Dict[str, Any]:
+    """
+    Run the full Hilbert pipeline on `corpus_dir`, writing outputs to
+    `results_dir`.
 
+    Returns a JSON-serialisable run summary for UI and API use.
+    """
     settings = settings or PipelineSettings()
     emit = emit or DEFAULT_EMIT
 
     _ensure_dir(results_dir)
-
     ctx = PipelineContext(
         corpus_dir=os.path.abspath(corpus_dir),
         results_dir=os.path.abspath(results_dir),
@@ -774,10 +681,10 @@ def run_pipeline(
         emit=emit,
     )
 
-    ctx.log("info", "Starting Hilbert pipeline", corpus=ctx.corpus_dir)
+    ctx.log("info", "Starting Hilbert pipeline run", corpus=ctx.corpus_dir)
 
-    # Execute stages in declared order
     for spec in sorted(STAGE_TABLE, key=lambda s: s.order):
+        # Check hard dependencies
         unmet = [
             d for d in spec.depends_on
             if ctx.stages.get(d, StageState(d, d)).status != "ok"
@@ -787,13 +694,15 @@ def run_pipeline(
             reason = f"dependencies not satisfied: {', '.join(unmet)}"
             if spec.required:
                 ctx.begin_stage(spec)
-                ctx.end_stage_failed(spec, reason)
+                ctx.end_stage_failed(spec, error=reason)
                 break
-            ctx.end_stage_skipped(spec, reason)
-            continue
+            else:
+                ctx.end_stage_skipped(spec, reason=reason)
+                continue
 
+        # Conceptual node only
         if spec.func is None:
-            ctx.end_stage_skipped(spec, "conceptual stage")
+            ctx.end_stage_skipped(spec, reason="no-op conceptual stage")
             continue
 
         ctx.begin_stage(spec)
@@ -801,23 +710,29 @@ def run_pipeline(
             spec.func(ctx)
             ctx.end_stage_ok(spec)
         except Exception as exc:
-            ctx.end_stage_failed(spec, str(exc))
+            ctx.end_stage_failed(spec, error=str(exc))
             if spec.required:
-                ctx.log("error", "Aborting pipeline", stage=spec.key)
+                ctx.log(
+                    "error",
+                    "Aborting pipeline due to failure in required stage.",
+                    stage=spec.key,
+                )
                 break
 
-    # Save run summary
     summary = ctx.run_summary(STAGE_TABLE)
+
+    # Persist run summary
     try:
-        run_json = os.path.join(ctx.results_dir, "hilbert_run.json")
-        with open(run_json, "w", encoding="utf-8") as f:
+        run_json_path = os.path.join(ctx.results_dir, "hilbert_run.json")
+        with open(run_json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         ctx.add_artifact("hilbert_run.json", "run-summary")
     except Exception as exc:
-        ctx.log("warn", f"Failed to write summary: {exc}")
+        ctx.log("warn", f"Failed to write hilbert_run.json: {exc}")
 
-    ctx.log("info", "Hilbert pipeline complete", run_id=ctx.run_id)
+    ctx.log("info", "Hilbert pipeline run complete", run_id=ctx.run_id)
     return summary
 
 
+# Backwards-compatible alias
 run_hilbert_pipeline = run_pipeline
