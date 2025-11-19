@@ -193,3 +193,6 @@ __all__ = [
     "suggest_next_elements",
     "score_element_sequence",
 ]
+
+from .edges_builder import build_element_edges
+__all__ += ["build_element_edges"]

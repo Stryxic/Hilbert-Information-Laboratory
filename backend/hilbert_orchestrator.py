@@ -63,6 +63,7 @@ try:
 
         # Element LM
         run_element_lm_stage,
+        build_element_edges,
     )
 except Exception as exc:  # very defensive import
     raise RuntimeError(f"[orchestrator] Failed to import hilbert_pipeline: {exc}") from exc
@@ -336,6 +337,27 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     merged.to_csv(elements_path, index=False)
     ctx.add_artifact("hilbert_elements.csv", "elements")
 
+    # ------------------------------------------------------------------
+    # Build pairwise edges between elements (Hilbert bond field)
+    # ------------------------------------------------------------------
+    try:
+        from hilbert_pipeline import build_molecules
+        bond_df = build_molecules(
+            elements_csv=elements_path,
+            out_dir=ctx.results_dir,
+            emit=ctx.emit,
+            return_edges=True
+        )
+
+        if isinstance(bond_df, pd.DataFrame) and not bond_df.empty:
+            edges_path = os.path.join(ctx.results_dir, "edges.csv")
+            bond_df.to_csv(edges_path, index=False)
+            ctx.add_artifact("edges.csv", "edges")
+
+    except Exception as exc:
+        ctx.log("warn", f"[lsa] Failed to compute edges: {exc}")
+
+
     # ---------------------------------------------
     # Write LSA field (flat for compatibility)
     # ---------------------------------------------
@@ -348,6 +370,17 @@ def _stage_lsa(ctx: PipelineContext) -> None:
         json.dump(lsa_flat, f, indent=2)
 
     ctx.add_artifact("lsa_field.json", "lsa-field")
+def _stage_edges(ctx: PipelineContext) -> None:
+    """
+    Build element-element edges from span-element fusion.
+
+    Produces:
+      - edges.csv
+    """
+    out_path = build_element_edges(ctx.results_dir, emit=ctx.emit)
+    if out_path:
+        ctx.add_artifact(os.path.basename(out_path), "edges")
+
 
 
 def _stage_molecules(ctx: PipelineContext) -> None:
@@ -477,6 +510,9 @@ def _stage_graph_export(ctx: PipelineContext) -> None:
 
     Delegates to export_graph_snapshots(results_dir, emit).
     """
+    if "graph_snapshots" not in ctx.stages or ctx.stages["graph_snapshots"].status != "ok":
+        raise RuntimeError("Skipping graph_export – graph_snapshots did not run successfully")
+
     export_graph_snapshots(ctx.results_dir, emit=ctx.emit)
     ctx.add_artifact("graph_export", "graph-export", artifact_kind="directory")
 
@@ -532,28 +568,41 @@ STAGE_TABLE: List[StageSpec] = [
         produces=["lsa_field.json", "hilbert_elements.csv"],
     ),
     StageSpec(
-        key="molecules",
-        order=2.0,
-        label="[2] Molecule layer",
-        func=_stage_molecules,
-        required=False,
-        dialectic_role="structure",
-        depends_on=["lsa_field"],
-        consumes=["hilbert_elements.csv"],
-        produces=["molecules.csv", "informational_compounds.json"],
-        supports=["graph_snapshots"],
-    ),
-    StageSpec(
         key="fusion",
-        order=3.0,
-        label="[3] Span - element fusion",
+        order=2.0,
+        label="[2] Span - element fusion",
         func=_stage_fusion,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field", "molecules"],
+        depends_on=["lsa_field"],           # <- removed "molecules"
         consumes=["hilbert_elements.csv"],
         produces=["span_element_fusion.csv", "compound_contexts.json"],
     ),
+    StageSpec(
+        key="edges",
+        order=2.5,
+        label="[2.5] Element co-occurrence edges",
+        func=_stage_edges,
+        required=False,
+        dialectic_role="structure",
+        depends_on=["fusion"],
+        consumes=["span_element_fusion.csv"],
+        produces=["edges.csv"],
+        supports=["molecules", "graph_snapshots"],
+    ),
+    StageSpec(
+        key="molecules",
+        order=3.0,
+        label="[3] Molecule layer",
+        func=_stage_molecules,
+        required=False,
+        dialectic_role="structure",
+        depends_on=["lsa_field", "edges"],  # <- now waits for edges
+        consumes=["hilbert_elements.csv", "edges.csv"],
+        produces=["molecules.csv", "informational_compounds.json"],
+        supports=["graph_snapshots"],
+    ),
+
     StageSpec(
         key="stability_metrics",
         order=4.0,

@@ -19,13 +19,24 @@
 # Returned dictionary for build_lsa_field():
 #   {
 #       "elements":        [ { "element": str, "index": int } ],
-#       "element_metrics": [ { "element": str, "index": int,
-#                              "collection_freq": int, "document_freq": int } ],
+#       "element_metrics": [ {
+#                              "element": str,
+#                              "index": int,
+#                              "collection_freq": int,
+#                              "document_freq": int,
+#                              "entropy": float,
+#                              "coherence": float,
+#                            } ],
 #       "field": {
 #           "embeddings":  np.ndarray shape (n_spans, k),
-#           "span_map":    [ { "doc": str, "span_id": int,
-#                              "text": str, "elements": [str, ...] } ],
+#           "span_map":    [ {
+#                              "doc": str,
+#                              "span_id": int,
+#                              "text": str,
+#                              "elements": [str, ...],
+#                           } ],
 #           "vocab":       [ str, ... ],
+#           "H_span":      [ float, ... ]   # optional per-span entropy
 #       }
 #   }
 # =============================================================================
@@ -315,6 +326,9 @@ STRUCTURAL_PREFIXES = (
     "cite",
 )
 
+# keep letters and spaces for multiword phrases
+ALPHA_SPACE_RE = re.compile(r"[^a-z\s]+")
+
 
 def is_informative_span(text: str) -> bool:
     """
@@ -347,7 +361,7 @@ def is_informative_span(text: str) -> bool:
 
 def normalise_token(t: str) -> str:
     """
-    Normalise raw token text into a canonical "element" form.
+    Normalise a single-word token into canonical element form.
 
     Rules:
       - lowercase
@@ -358,6 +372,7 @@ def normalise_token(t: str) -> str:
     if not t:
         return ""
     t = t.strip().lower()
+    # For single tokens we remove all non letters
     t = re.sub(r"[^a-z]+", "", t)
     if len(t) <= 2:
         return ""
@@ -373,14 +388,55 @@ def normalise_token(t: str) -> str:
     return t
 
 
+def normalise_phrase(text: str) -> str:
+    """
+    Normalise a multiword noun phrase, preserving word boundaries.
+
+    This avoids the earlier behaviour where "information theory" became
+    "informationtheory". Spaces are retained and then regularised.
+
+    Rules:
+      - lowercase
+      - keep letters and spaces only
+      - collapse multiple spaces
+      - require at least two non-trivial words
+      - drop phrases that look like structural labels
+    """
+    if not text:
+        return ""
+    t = text.lower()
+    # strip everything except letters and spaces
+    t = ALPHA_SPACE_RE.sub(" ", t)
+    t = MULTI_WS_RE.sub(" ", t).strip()
+    if not t:
+        return ""
+
+    words = [w for w in t.split(" ") if len(w) > 2]
+    if len(words) < 2:
+        # if it is effectively a single word, let normalise_token handle it
+        return ""
+
+    # discard phrases that are obviously structural
+    for w in words:
+        for prefix in STRUCTURAL_PREFIXES:
+            if w.startswith(prefix):
+                return ""
+
+    # require at least one vowel across all words
+    if not any(re.search(r"[aeiou]", w) for w in words):
+        return ""
+
+    return " ".join(words)
+
+
 def extract_elements_from_text(text: str) -> List[str]:
     """
     Extract noun-like "elements" from a span of text.
 
     Strategy:
       - If spaCy is available, use:
-          - noun chunks
-          - NOUN / PROPN tokens
+          - noun chunks as multiword elements (spaces preserved)
+          - NOUN / PROPN tokens as single-word elements
       - Otherwise, fall back to a simple regex-based word extractor.
 
     Returns a list of canonicalised element strings.
@@ -391,11 +447,11 @@ def extract_elements_from_text(text: str) -> List[str]:
     if nlp is not None:
         doc = nlp(text)
 
-        # 1) Noun chunks
+        # 1) Multiword noun chunks, preserving spaces
         for chunk in getattr(doc, "noun_chunks", []):
-            norm = normalise_token(chunk.text)
-            if norm:
-                elements.append(norm)
+            phrase_norm = normalise_phrase(chunk.text)
+            if phrase_norm:
+                elements.append(phrase_norm)
 
         # 2) Standalone NOUN / PROPN tokens
         for token in doc:
@@ -406,10 +462,27 @@ def extract_elements_from_text(text: str) -> List[str]:
 
     else:
         # Fallback: simple word extraction
-        for raw in re.findall(r"[A-Za-z][A-Za-z\-]{2,}", text):
+        # Use explicit word regex on the raw text, then normalise each token
+        raw_words = re.findall(r"[A-Za-z][A-Za-z\-]{2,}", text)
+        norm_words: List[str] = []
+        for raw in raw_words:
             norm = normalise_token(raw)
             if norm:
+                norm_words.append(norm)
                 elements.append(norm)
+
+        # Optional: light bigram phrases from adjacent words
+        # This gives a crude way of capturing "information theory" style
+        # elements even without spaCy, while avoiding concatenation.
+        for i in range(len(norm_words) - 1):
+            w1, w2 = norm_words[i], norm_words[i + 1]
+            if not w1 or not w2:
+                continue
+            phrase = f"{w1} {w2}"
+            # respect phrase filters
+            phrase_norm = normalise_phrase(phrase)
+            if phrase_norm:
+                elements.append(phrase_norm)
 
     return elements
 
@@ -432,7 +505,7 @@ def compute_lsa_embeddings(
     embeddings : np.ndarray
         Matrix of shape (n_spans, n_components).
     vocab : list of str
-        Vocabulary of extracted elements.
+        Vocabulary of extracted elements (can include spaces).
     vectorizer : fitted TfidfVectorizer
         Returned so that caller can inspect IDF / feature names if needed.
     """
@@ -486,9 +559,14 @@ def run_lsa_layer(
     Returns a dict:
       {
         "elements":        [ { "element": e, "index": idx } ],
-        "element_metrics": [ { "element": e, "index": idx,
+        "element_metrics": [ {
+                               "element": e,
+                               "index": idx,
                                "collection_freq": cf,
-                               "document_freq": df } ],
+                               "document_freq": df,
+                               "entropy": float,
+                               "coherence": float,
+                             } ],
         "vocab":           [ ... ],
         "embeddings":      np.ndarray (n_spans, k),
         "span_map":        [
@@ -496,6 +574,7 @@ def run_lsa_layer(
                                 "text": str, "elements": [str, ...] },
                               ...
                            ],
+        "span_entropy":    [ float, ... ]  # per-span entropy (optional)
       }
     """
     corpus_dir = Path(corpus_dir)
@@ -525,9 +604,7 @@ def run_lsa_layer(
                 if not is_informative_span(s):
                     continue
                 elems = extract_elements_from_text(s)
-                if not elems:
-                    # keep spans even if element extraction fails; LSA may still
-                    # recover structure via neighbouring spans
+                if elems is None:
                     elems = []
                 spans.append(s)
                 span_map.append(
@@ -548,7 +625,7 @@ def run_lsa_layer(
                 if not is_informative_span(s):
                     continue
                 elems = extract_elements_from_text(s)
-                if not elems:
+                if elems is None:
                     elems = []
                 spans.append(s)
                 span_map.append(
@@ -569,25 +646,60 @@ def run_lsa_layer(
             "vocab": [],
             "embeddings": np.zeros((0, 0), dtype=float),
             "span_map": [],
+            "span_entropy": [],
         }
 
+    # LSA: embeddings + vocab + vectorizer
     embeddings, vocab, vectorizer = compute_lsa_embeddings(
         spans, n_components=n_components, max_vocab=max_vocab
     )
 
-    # Build a minimal element registry and metrics.
+    # -------------------------------------------------------------------------
+    # Derive TF-IDF matrix again from the fitted vectorizer to compute:
+    #   - collection_freq (cf)
+    #   - document_freq (df)
+    #   - element entropy (over spans)
+    #   - element coherence (via centroid similarity in embedding space)
+    #   - span entropy (over vocabulary)
+    # -------------------------------------------------------------------------
+    if vectorizer is not None:
+        X = vectorizer.transform(spans)  # (n_spans, n_terms)
+    else:
+        # Very defensive fallback
+        X = None
+
+    n_spans = len(spans)
+    n_terms = len(vocab)
+
+    # Per-span entropy H_span[i]
+    H_span: List[float] = []
+    if X is not None:
+        for i in range(n_spans):
+            row = X.getrow(i).toarray().ravel()
+            total = float(row.sum())
+            if total <= 0.0:
+                H_span.append(0.0)
+                continue
+            p = row / total
+            # numerical guard: ignore zero entries
+            mask = p > 0
+            p_masked = p[mask]
+            H = -float(np.sum(p_masked * np.log(p_masked)))
+            H_span.append(H)
+    else:
+        H_span = [0.0] * n_spans
+
+    # Build element registry from vocab
     element_to_index: Dict[str, int] = {e: i for i, e in enumerate(vocab)}
 
-    # Term frequencies (collection frequency) and document frequency by span.
+    # Collection frequency and document frequency
     cf_counter: Counter[str] = Counter()
     df_counter: Counter[str] = Counter()
 
-    # Use the same tokenizer logic we used in the vectorizer, but we
-    # already have per-span elements in span_map, so reuse them if possible.
+    # We use span_map "elements" if present; otherwise fallback to tokenisation.
     for span_rec in span_map:
         elems = span_rec.get("elements") or []
         if not elems:
-            # fallback to on-the-fly extraction
             elems = extract_elements_from_text(span_rec.get("text", ""))
         if not elems:
             continue
@@ -595,12 +707,61 @@ def run_lsa_layer(
         for e in set(elems):
             df_counter[e] += 1
 
+    # -------------------------------------------------------------------------
+    # Element-level entropy & coherence
+    # -------------------------------------------------------------------------
+    # entropy(e): distribution of e across spans using TF–IDF magnitudes
+    # coherence(e): how tightly clustered the spans of e are in LSA space
+    element_entropy: Dict[str, float] = {}
+    element_coherence: Dict[str, float] = {}
+
+    if X is not None and embeddings is not None and embeddings.size > 0:
+        emb_arr = np.asarray(embeddings, dtype=float)
+        for term_idx, term in enumerate(vocab):
+            col = X[:, term_idx].toarray().ravel()
+            total = float(col.sum())
+            if total <= 0.0:
+                element_entropy[term] = 0.0
+                element_coherence[term] = 0.0
+                continue
+
+            # entropy over spans
+            p = col / total
+            mask = p > 0
+            p_masked = p[mask]
+            H_e = -float(np.sum(p_masked * np.log(p_masked)))
+            element_entropy[term] = H_e
+
+            # coherence via centroid similarity in embedding space
+            span_idxs = np.where(col > 0)[0]
+            if span_idxs.size <= 1:
+                element_coherence[term] = 0.0
+                continue
+
+            vecs = emb_arr[span_idxs, :]  # (m, k)
+            centroid = vecs.mean(axis=0)
+            # normalise for cosine similarity
+            vecs_norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
+            centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
+            sims = np.dot(vecs_norm, centroid_norm)
+            element_coherence[term] = float(np.mean(sims))
+    else:
+        # conservative fallback if we somehow lack X or embeddings
+        for term in vocab:
+            element_entropy[term] = 0.0
+            element_coherence[term] = 0.0
+
+    # -------------------------------------------------------------------------
+    # Assemble element registry + metrics
+    # -------------------------------------------------------------------------
     elements: List[Dict[str, Any]] = []
     element_metrics: List[Dict[str, Any]] = []
 
     for e, idx in element_to_index.items():
         cf = int(cf_counter.get(e, 0))
         df = int(df_counter.get(e, 0))
+        H_e = float(element_entropy.get(e, 0.0))
+        C_e = float(element_coherence.get(e, 0.0))
         elements.append({"element": e, "index": idx})
         element_metrics.append(
             {
@@ -608,6 +769,8 @@ def run_lsa_layer(
                 "index": idx,
                 "collection_freq": cf,
                 "document_freq": df,
+                "entropy": H_e,
+                "coherence": C_e,
             }
         )
 
@@ -617,6 +780,7 @@ def run_lsa_layer(
         "vocab": vocab,
         "embeddings": embeddings,
         "span_map": span_map,
+        "span_entropy": H_span,
     }
 
 
@@ -644,6 +808,7 @@ def build_lsa_field(
                 "embeddings": ndarray,
                 "span_map": [...],
                 "vocab": [...],
+                "H_span": [...],  # optional per-span entropy
             }
         }
     """
@@ -660,12 +825,15 @@ def build_lsa_field(
     span_map = res.get("span_map", []) or []
     embeddings = res.get("embeddings")
     vocab = res.get("vocab", []) or []
+    H_span = res.get("span_entropy")
 
-    field = {
+    field: Dict[str, Any] = {
         "embeddings": embeddings,
         "span_map": span_map,
         "vocab": vocab,
     }
+    if H_span is not None:
+        field["H_span"] = H_span
 
     out = {
         "elements": elements,
