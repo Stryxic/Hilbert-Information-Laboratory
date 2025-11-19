@@ -2,7 +2,7 @@
 Hilbert Information Pipeline - public API aggregator.
 
 This module re-exports the main computational primitives of the pipeline so that
-the orchestrator and any higher level tools can import everything from the
+the orchestrator and higher-level tools can import everything from the
 `hilbert_pipeline` package root.
 
 It also defines DEFAULT_EMIT, a no-op logger used as a safe fallback by
@@ -10,7 +10,6 @@ optional layers such as the epistemic signatures module.
 """
 
 from __future__ import annotations
-
 from typing import Any, Callable, Dict, Optional
 
 # ======================================================================
@@ -18,13 +17,7 @@ from typing import Any, Callable, Dict, Optional
 # ======================================================================
 
 def DEFAULT_EMIT(kind: str, payload: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Fallback "do nothing" emitter.
-
-    Real callers (the orchestrator, web API, CLI) usually provide their own
-    `emit(kind, payload)` function. Code inside pipeline modules should always
-    accept an `emit` argument but never rely on it doing anything.
-    """
+    """Fallback 'do nothing' emitter."""
     return None
 
 
@@ -32,7 +25,7 @@ def DEFAULT_EMIT(kind: str, payload: Optional[Dict[str, Any]] = None) -> None:
 # LSA layer
 # ======================================================================
 
-from .lsa_layer import (  # noqa: E402,F401
+from .lsa_layer import (
     build_lsa_field,
 )
 
@@ -41,7 +34,7 @@ from .lsa_layer import (  # noqa: E402,F401
 # Molecule layer
 # ======================================================================
 
-from .molecule_layer import (  # noqa: E402,F401
+from .molecule_layer import (
     run_molecule_stage,
     aggregate_compounds,
     compute_molecule_stability,
@@ -50,83 +43,69 @@ from .molecule_layer import (  # noqa: E402,F401
 )
 
 def build_molecules(*args, **kwargs):
-    """Backwards compatible alias expected by older orchestrator code."""
+    """Backwards-compatible alias for older orchestrator code."""
     return run_molecule_stage(*args, **kwargs)
 
 def run_molecule_layer(*args, **kwargs):
-    """Compatibility alias - identical to `run_molecule_stage`."""
+    """Alias for run_molecule_stage."""
     return run_molecule_stage(*args, **kwargs)
 
 
 # ======================================================================
-# Span - element fusion and compound context
+# Span–element fusion + compound context
 # ======================================================================
 
-from .fusion import (  # noqa: E402,F401
+from .fusion import (
     fuse_spans_to_elements,
     aggregate_compound_context,
 )
 
 def run_fusion_pipeline(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
-    """
-    Thin wrapper for span -> element fusion + compound context aggregation.
-    """
+    """Thin wrapper combining fusion + compound aggregation."""
     fuse_spans_to_elements(results_dir, emit=emit)
     aggregate_compound_context(results_dir, emit=emit)
 
 
 # ======================================================================
-# Element labels and descriptions
+# Element labels
 # ======================================================================
 
-from .element_labels import (  # noqa: E402,F401
+from .element_labels import (
     build_element_descriptions,
 )
 
 
 # ======================================================================
-# Stability / persistence visuals
+# Stability + persistence visuals
 # ======================================================================
 
-from .stability_layer import (  # noqa: E402,F401
-    compute_signal_stability,
-)
-
-from .persistence_visuals import (  # noqa: E402,F401
-    plot_persistence_field,
-)
+from .stability_layer import compute_signal_stability
+from .persistence_visuals import plot_persistence_field
 
 def run_persistence_visuals(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
-    """Compatibility wrapper for persistence visuals."""
     emit("log", {"stage": "persistence_visuals", "event": "start"})
     plot_persistence_field(results_dir)
     emit("log", {"stage": "persistence_visuals", "event": "end"})
 
 
 # ======================================================================
-# Graph export and snapshots
+# Graphs
 # ======================================================================
 
-from .graph_snapshots import (  # noqa: E402,F401
-    generate_graph_snapshots,
-)
-
-from .graph_export import (  # noqa: E402,F401
-    export_graph_snapshots,
-)
+from .graph_snapshots import generate_graph_snapshots
+from .graph_export import export_graph_snapshots
 
 
 # ======================================================================
-# Full export (PDF, ZIP)
+# Export (PDF + ZIP)
 # ======================================================================
 
-from .hilbert_export import (  # noqa: E402,F401
+from .hilbert_export import (
     export_summary_pdf,
     export_zip,
 )
 
 def run_full_export(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
-    """Produce both PDF and ZIP summaries."""
     emit("log", {"stage": "export", "event": "start"})
     export_summary_pdf(results_dir)
     export_zip(results_dir)
@@ -134,12 +113,34 @@ def run_full_export(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
 
 
 # ======================================================================
-# Misinfo / epistemic signatures layer
+# Epistemic Signatures
 # ======================================================================
 
-from .signatures import (  # noqa: E402,F401
-    compute_signatures,
-)
+from .signatures import compute_signatures
+
+
+# ======================================================================
+# Optional: Element Language Model (safe import)
+# ======================================================================
+
+try:
+    from .element_language_model import (
+        run_element_lm_stage,
+        suggest_next_elements,
+        score_element_sequence,
+    )
+except Exception as exc:
+    print(f"[hilbert_pipeline] Element LM unavailable: {exc}")
+
+    # Safe fallback stubs so orchestrator import NEVER fails
+    def run_element_lm_stage(*args, **kwargs):
+        print("[element_lm] Skipped: module unavailable")
+
+    def suggest_next_elements(*args, **kwargs):
+        return []
+
+    def score_element_sequence(*args, **kwargs):
+        return 0.0
 
 
 # ======================================================================
@@ -170,20 +171,25 @@ __all__ = [
     # Labels
     "build_element_descriptions",
 
-    # Stability and visuals
+    # Stability + persistence
     "compute_signal_stability",
     "plot_persistence_field",
     "run_persistence_visuals",
 
-    # Graph views
+    # Graphs
     "generate_graph_snapshots",
     "export_graph_snapshots",
 
-    # Exports
+    # Export
     "export_summary_pdf",
     "export_zip",
     "run_full_export",
 
-    # Misinfo layer
+    # Epistemic signatures
     "compute_signatures",
+
+    # Element LM (optional but guaranteed to exist)
+    "run_element_lm_stage",
+    "suggest_next_elements",
+    "score_element_sequence",
 ]

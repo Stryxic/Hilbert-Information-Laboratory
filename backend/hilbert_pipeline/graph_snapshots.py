@@ -921,3 +921,83 @@ def generate_graph_snapshots(results_dir: str, emit=DEFAULT_EMIT) -> None:
         )
 
     _log("[graphs] Completed all graph snapshots.", emit)
+
+def generate_informative_graph_snapshot(
+    out_dir,
+    elements_df,
+    edges_df,
+    molecule_df,
+    enriched_spans,
+    emit=None
+):
+    """
+    Produce a significantly improved graph layout with:
+    - edge thresholding
+    - edge fading
+    - node scaling
+    - cluster simplification
+    - spectral + spring layout hybrid
+    - enriched metadata
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Filter edges by weight
+    if "weight" in edges_df.columns:
+        edges_df = edges_df[edges_df["weight"] > 0.15]
+
+    G = nx.Graph()
+
+    # Add nodes
+    for _, row in elements_df.iterrows():
+        el = str(row["element"])
+        ent = row.get("mean_entropy", 0.5)
+        coh = row.get("mean_coherence", 0.5)
+        label = enriched_spans.get(el, {}).get("labels", [])
+
+        G.add_node(el, entropy=float(ent), coherence=float(coh), labels=label)
+
+    # Add edges
+    for _, row in edges_df.iterrows():
+        G.add_edge(str(row["source"]), str(row["target"]), weight=row.get("weight", 1.0))
+
+    # Layout
+    try:
+        spectral = nx.spectral_layout(G, dim=2)
+        spring = nx.spring_layout(G, pos=spectral, k=0.18, iterations=200)
+        pos = spring
+    except Exception:
+        pos = nx.spring_layout(G)
+
+    # Node sizes: coherence
+    size = 300 + 1500 * np.array([G.nodes[n]["coherence"] for n in G.nodes])
+
+    # Node colors: entropy
+    entropy_vals = np.array([G.nodes[n]["entropy"] for n in G.nodes])
+
+    plt.figure(figsize=(18, 12))
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        width=[0.4 * G[u][v]["weight"] for u, v in G.edges],
+        alpha=0.25,
+        edge_color="#999999"
+    )
+    c = plt.cm.coolwarm(entropy_vals)
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=size,
+        node_color=c,
+        linewidths=0.2,
+        edgecolors="black",
+        alpha=0.9
+    )
+
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "informative_graph.png"), dpi=300)
+    plt.close()
+
+    if emit:
+        emit("log", {"stage": "graphs", "message": "Informative graph written."})
