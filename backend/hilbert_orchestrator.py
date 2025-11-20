@@ -28,6 +28,7 @@ import pandas as pd
 # Pipeline imports (all via hilbert_pipeline public API)
 # -----------------------------------------------------------------------------
 
+
 try:
     from hilbert_pipeline import (
         DEFAULT_EMIT,
@@ -64,6 +65,8 @@ try:
         # Element LM
         run_element_lm_stage,
         build_element_edges,
+        compute_corpus_perplexity,
+        compute_compound_stability, 
     )
 except Exception as exc:  # very defensive import
     raise RuntimeError(f"[orchestrator] Failed to import hilbert_pipeline: {exc}") from exc
@@ -338,24 +341,11 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     ctx.add_artifact("hilbert_elements.csv", "elements")
 
     # ------------------------------------------------------------------
-    # Build pairwise edges between elements (Hilbert bond field)
+    # LSA layer no longer computes edges internally
     # ------------------------------------------------------------------
-    try:
-        from hilbert_pipeline import build_molecules
-        bond_df = build_molecules(
-            elements_csv=elements_path,
-            out_dir=ctx.results_dir,
-            emit=ctx.emit,
-            return_edges=True
-        )
+    ctx.log("info", "[lsa] Edge generation disabled – handled by stage_edges")
 
-        if isinstance(bond_df, pd.DataFrame) and not bond_df.empty:
-            edges_path = os.path.join(ctx.results_dir, "edges.csv")
-            bond_df.to_csv(edges_path, index=False)
-            ctx.add_artifact("edges.csv", "edges")
 
-    except Exception as exc:
-        ctx.log("warn", f"[lsa] Failed to compute edges: {exc}")
 
 
     # ---------------------------------------------
@@ -438,6 +428,38 @@ def _stage_stability(ctx: PipelineContext) -> None:
     # The stability module will decide whether it actually wrote the file.
     if os.path.exists(out_csv):
         ctx.add_artifact("signal_stability.csv", "signal-stability")
+
+
+def _stage_compound_stability(ctx: PipelineContext) -> None:
+    """
+    Compute compound-level stability from element-level stability + molecule table.
+
+    Produces:
+      - compound_stability.csv
+    """
+    try:
+        elements_csv = os.path.join(ctx.results_dir, "hilbert_elements.csv")
+        stability_csv = os.path.join(ctx.results_dir, "signal_stability.csv")
+        compounds_json = os.path.join(ctx.results_dir, "informational_compounds.json")
+        out_csv = os.path.join(ctx.results_dir, "compound_stability.csv")
+
+        if not os.path.exists(compounds_json):
+            ctx.log("warn", "[compound-stability] Missing compounds – skipping")
+            return
+
+        compute_compound_stability(
+            compounds_json=compounds_json,
+            elements_csv=elements_csv,
+            stability_csv=stability_csv,
+            out_csv=out_csv,
+            emit=ctx.emit,
+        )
+
+        if os.path.exists(out_csv):
+            ctx.add_artifact("compound_stability.csv", "compound-stability")
+
+    except Exception as exc:
+        ctx.log("warn", f"[compound-stability] Failed: {exc}")
 
 
 def _stage_persistence(ctx: PipelineContext) -> None:
@@ -535,6 +557,43 @@ def _stage_element_lm(ctx: PipelineContext) -> None:
         if os.path.exists(path):
             ctx.add_artifact(fname, kind)
 
+def _stage_lm_perplexity(ctx: PipelineContext) -> None:
+    """
+    LM perplexity over the corpus using Ollama logprobs.
+    Produces:
+      - lm_metrics.json
+    """
+    try:
+        from pathlib import Path
+        out_path = Path(ctx.results_dir) / "lm_metrics.json"
+
+
+        # Prefer preloaded text if available
+        text = ctx.extras.get("corpus_text")
+
+        # Otherwise load spans.jsonl (default)
+        if not text:
+            spans_path = os.path.join(ctx.results_dir, "spans.jsonl")
+            pieces = []
+            if os.path.exists(spans_path):
+                with open(spans_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            obj = json.loads(line)
+                            pieces.append(obj.get("text", ""))
+                        except:
+                            pass
+            text = "\n".join(pieces)[:12000]  # Safe cap
+
+        res = compute_corpus_perplexity(
+    corpus_text=text,
+    out_path=out_path,
+)
+        ctx.add_artifact("lm_metrics.json", "lm-metrics")
+
+    except Exception as exc:
+        ctx.log("warn", f"[lm] Perplexity computation failed: {exc}")
+
 
 def _stage_full_export(ctx: PipelineContext) -> None:
     """
@@ -565,7 +624,7 @@ STAGE_TABLE: List[StageSpec] = [
         func=_stage_lsa,
         required=True,
         dialectic_role="evidence",
-        produces=["lsa_field.json", "hilbert_elements.csv"],
+        supports=["fusion", "edges"],
     ),
     StageSpec(
         key="fusion",
@@ -597,7 +656,7 @@ STAGE_TABLE: List[StageSpec] = [
         func=_stage_molecules,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field", "edges"],  # <- now waits for edges
+        depends_on=["edges"],
         consumes=["hilbert_elements.csv", "edges.csv"],
         produces=["molecules.csv", "informational_compounds.json"],
         supports=["graph_snapshots"],
@@ -613,8 +672,21 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["lsa_field"],
         consumes=["hilbert_elements.csv"],
         produces=["signal_stability.csv"],
-        supports=["persistence_visuals", "epistemic_signatures"],
+        supports=["persistence_visuals", "compound_stability", "epistemic_signatures"],
     ),
+    StageSpec(
+        key="compound_stability",
+        order=4.5,
+        label="[4.5] Compound stability metrics",
+        func=_stage_compound_stability,
+        required=False,
+        dialectic_role="thermo",
+        depends_on=["stability_metrics", "molecules"],
+        consumes=["signal_stability.csv", "molecules.csv"],
+        produces=["compound_stability.csv"],
+        supports=["graph_snapshots", "export_all"],
+    ),
+
     StageSpec(
         key="persistence_visuals",
         order=5.0,
@@ -666,6 +738,17 @@ STAGE_TABLE: List[StageSpec] = [
         produces=["element_lm.pt", "element_vocab.json"],
     ),
     StageSpec(
+        key="lm_perplexity",
+        order=6.85,
+        label="[6.85] LM Perplexity (Ollama)",
+        func=_stage_lm_perplexity,
+        required=False,
+        dialectic_role="epistemic",
+        depends_on=["lsa_field"],
+        produces=["lm_metrics.json"],
+    ),
+
+    StageSpec(
         key="graph_snapshots",
         order=7.0,
         label="[7] Graph snapshots",
@@ -692,7 +775,7 @@ STAGE_TABLE: List[StageSpec] = [
         func=_stage_full_export,
         required=False,
         dialectic_role="export",
-        depends_on=["element_labels"],
+        depends_on=["element_labels", "compound_stability", "lm_perplexity"],
         supports=["epistemic_signatures"],
         produces=["hilbert_summary.pdf", "hilbert_run.zip"],
     ),

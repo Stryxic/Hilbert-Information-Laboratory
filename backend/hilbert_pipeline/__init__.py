@@ -79,7 +79,7 @@ from .element_labels import (
 # Stability + persistence visuals
 # ======================================================================
 
-from .stability_layer import compute_signal_stability
+from .stability_layer import compute_signal_stability, compute_compound_stability
 from .persistence_visuals import plot_persistence_field
 
 def run_persistence_visuals(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
@@ -196,3 +196,7 @@ __all__ = [
 
 from .edges_builder import build_element_edges
 __all__ += ["build_element_edges"]
+
+# backend/hilbert_pipeline/__init__.py
+from .ollama_lm import compute_corpus_perplexity  # new export
+__all__ += ["compute_corpus_perplexity"]
