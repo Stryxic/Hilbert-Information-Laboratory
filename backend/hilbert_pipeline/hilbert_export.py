@@ -1,25 +1,20 @@
 # =============================================================================
-# hilbert_pipeline/hilbert_export.py — Summary PDF and ZIP Export (Enhanced)
+# hilbert_pipeline/hilbert_export.py - Summary PDF and ZIP Export (Pedagogical)
 # =============================================================================
 """
 Generate a comprehensive summary report (PDF) and an export ZIP bundle
 for each Hilbert pipeline run.
 
-The PDF integrates:
-  - Corpus metrics (spans, elements, entropy, coherence)
-  - Pipeline run overview (run id, settings, corpus, results folder)
-  - Stage-by-stage timeline (status, duration, dialectic role when available)
-  - Dialectic structure summary (support / challenge relations)
-  - Element root field (from element_roots.csv / element_cluster_metrics.json)
-  - Compound field summary (from compound_metrics.json)
-  - Compound table (from informational_compounds.json, top 10 by stability)
-  - Regime composition chart (info/misinfo/disinfo, if available)
-  - Compound context availability
-  - Embedded figures from the run, with:
-        * Graph progression snapshots (graph_*.png) laid out as smaller
-          panels showing evolution as a sequence.
-        * Other figures as full-width pages.
-  - Metadata footer
+This version is structured as a pedagogical ladder:
+
+  Part I   - Orientation for a complete novice:
+             * What this report is
+             * What a corpus, span, element, and compound are
+  Part II  - Intuitive overview of the pipeline stages
+  Part III - Core quantitative metrics (entropy, coherence, regimes, graph)
+  Part IV  - Compound and stability analysis
+  Part V   - Dialectic structure and pipeline artifacts
+  Part VI  - Visual appendix (graphs, persistence fields, etc.)
 
 The ZIP bundle includes core CSV/JSON/PNG/PDF artifacts for archiving.
 
@@ -213,6 +208,9 @@ def _read_elements_info(out_dir: str) -> dict:
 def _read_num_spans(out_dir: str) -> Optional[int]:
     """
     Use lsa_field.json embeddings length as span count, if available.
+
+    A span is a short piece of text (for example a sentence or clause)
+    that the system analyzes as a single unit.
     """
     path = os.path.join(out_dir, "lsa_field.json")
     data = _read_json(path)
@@ -227,6 +225,11 @@ def _read_num_spans(out_dir: str) -> Optional[int]:
 def _read_regime_profile(out_dir: str) -> Tuple[float, float, float]:
     """
     Estimate global regime composition from hilbert_elements.csv scores.
+
+    These scores represent how each element behaves on average as:
+      - informational (truthful, neutral)
+      - misinformational (inaccurate, but without malicious intent)
+      - disinformational (inaccurate, with malicious intent)
     """
     path = os.path.join(out_dir, "hilbert_elements.csv")
     if not os.path.exists(path):
@@ -246,6 +249,9 @@ def _read_regime_profile(out_dir: str) -> Tuple[float, float, float]:
 def _read_root_stats(out_dir: str) -> Dict[str, Any]:
     """
     Summarize condensed root field (if available).
+
+    Roots group together different surface forms that behave
+    like the same underlying informational concept.
     """
     roots_path = os.path.join(out_dir, "element_roots.csv")
     metrics_path = os.path.join(out_dir, "element_cluster_metrics.json")
@@ -277,6 +283,148 @@ def _read_root_stats(out_dir: str) -> Dict[str, Any]:
 def _has_compound_contexts(out_dir: str) -> bool:
     path = os.path.join(out_dir, "compound_contexts.json")
     return os.path.exists(path)
+
+
+def _read_lm_metrics(out_dir: str) -> Dict[str, Any]:
+    """
+    Read language model scoring metrics from lm_metrics.json, if present.
+
+    Expected keys (tolerant):
+      - model
+      - perplexity or ppl
+      - n_tokens or num_tokens
+    """
+    path = os.path.join(out_dir, "lm_metrics.json")
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return {}
+
+    model = data.get("model") or data.get("lm_model")
+    ppl = data.get("perplexity")
+    if ppl is None:
+        ppl = data.get("ppl")
+    n_tokens = data.get("n_tokens")
+    if n_tokens is None:
+        n_tokens = data.get("num_tokens")
+
+    out: Dict[str, Any] = {}
+    if model:
+        out["model"] = str(model)
+    if ppl is not None:
+        try:
+            out["perplexity"] = float(ppl)
+        except Exception:
+            pass
+    if n_tokens is not None:
+        try:
+            out["n_tokens"] = int(n_tokens)
+        except Exception:
+            pass
+
+    return out
+
+
+def _read_compound_stability_table(out_dir: str) -> pd.DataFrame:
+    """
+    Read per compound stability metrics from compound_stability.csv, if present.
+
+    Typical columns:
+      compound_id, n_elements, mean_element_coherence,
+      mean_element_stability, stability_variance
+    """
+    path = os.path.join(out_dir, "compound_stability.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+    for col in (
+        "n_elements",
+        "mean_element_coherence",
+        "mean_element_stability",
+        "stability_variance",
+    ):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "compound_id" in df.columns:
+        df["compound_id"] = df["compound_id"].astype(str)
+
+    return df
+
+
+def _read_graph_metrics(out_dir: str) -> Dict[str, Any]:
+    """
+    Summarise the informational graph structure from edges.csv.
+
+    Returns keys:
+      num_nodes, num_edges, avg_degree, num_components,
+      num_communities, modularity
+    """
+    metrics: Dict[str, Any] = {
+        "num_nodes": None,
+        "num_edges": None,
+        "avg_degree": None,
+        "num_components": None,
+        "num_communities": None,
+        "modularity": None,
+    }
+
+    edges_path = os.path.join(out_dir, "edges.csv")
+    if not os.path.exists(edges_path):
+        return metrics
+
+    try:
+        edges_df = pd.read_csv(edges_path)
+    except Exception:
+        return metrics
+
+    if "source" not in edges_df.columns or "target" not in edges_df.columns:
+        return metrics
+
+    sources = edges_df["source"].astype(str)
+    targets = edges_df["target"].astype(str)
+    nodes = set(sources) | set(targets)
+    m = int(len(edges_df))
+    n = int(len(nodes))
+    if n == 0:
+        return metrics
+
+    metrics["num_nodes"] = n
+    metrics["num_edges"] = m
+    metrics["avg_degree"] = 2.0 * m / float(n)
+
+    try:
+        import networkx as nx  # type: ignore
+    except Exception:
+        return metrics
+
+    G = nx.Graph()
+    for s, t in zip(sources, targets):
+        if s and t and s != t:
+            G.add_edge(str(s), str(t))
+
+    if G.number_of_nodes() == 0:
+        return metrics
+
+    metrics["num_components"] = nx.number_connected_components(G)
+
+    try:
+        from networkx.algorithms.community import greedy_modularity_communities
+        from networkx.algorithms.community.quality import modularity
+
+        communities = list(greedy_modularity_communities(G))
+        metrics["num_communities"] = len(communities)
+        if len(communities) > 1:
+            metrics["modularity"] = float(modularity(G, communities))
+    except Exception:
+        # modularity is nice to have but not essential
+        pass
+
+    return metrics
 
 
 # -------------------------------------------------------------------------#
@@ -367,7 +515,6 @@ def _collect_figure_paths(out_dir: str) -> List[str]:
     Deduplicates and tries to present key figures first.
     """
     all_pngs: List[str] = []
-    base = os.path.abspath(out_dir)
 
     for root, _, files in os.walk(out_dir):
         for fname in files:
@@ -380,7 +527,7 @@ def _collect_figure_paths(out_dir: str) -> List[str]:
     seen = set()
     unique: List[str] = []
     for p in sorted(all_pngs):
-        rel = os.path.relpath(p, base).replace("\\", "/")
+        rel = os.path.relpath(p, out_dir).replace("\\", "/")
         if rel in seen:
             continue
         seen.add(rel)
@@ -405,39 +552,32 @@ def _collect_figure_paths(out_dir: str) -> List[str]:
     return unique
 
 
-def _split_graph_and_other_figs(out_dir: str, fig_paths: List[str]) -> Tuple[List[str], List[str]]:
+def _split_graph_and_other_figs(
+    out_dir: str, fig_paths: List[str]
+) -> Tuple[List[str], List[str]]:
     """
     Split figures into:
       - graph progression snapshots (graph_*.png) from the run root
       - other figures (persistence, stability, export graphs, etc)
-
-    We only treat graph_*.png in the run root as progression snapshots
-    to avoid duplicates from results_dir/figures.
     """
     base = os.path.abspath(out_dir)
     graph_paths: List[str] = []
     other_paths: List[str] = []
 
-    # temporary mapping by basename for root only
     root_graphs: Dict[str, str] = {}
-
     graph_re = re.compile(r"^graph_(\d+|full)\.png$", re.IGNORECASE)
 
     for p in fig_paths:
         name = os.path.basename(p)
         rel_dir = os.path.relpath(os.path.dirname(p), base).replace("\\", "/")
         if graph_re.match(name):
-            # treat only root level as the canonical progression snapshots
             if rel_dir in (".", ""):
-                # keep one path per basename
                 root_graphs.setdefault(name, p)
             else:
-                # falls back into other figures
                 other_paths.append(p)
         else:
             other_paths.append(p)
 
-    # sort graph snapshots by numeric size, with "full" last
     def gkey(name_path: Tuple[str, str]) -> Tuple[int, int]:
         name, _p = name_path
         m = graph_re.match(name)
@@ -454,20 +594,24 @@ def _split_graph_and_other_figs(out_dir: str, fig_paths: List[str]) -> Tuple[Lis
     graph_items = sorted(root_graphs.items(), key=gkey)
     graph_paths = [p for _name, p in graph_items]
 
-    # keep other_paths stable and de-duplicated
-    seen = set()
+    seen_other = set()
     dedup_other: List[str] = []
     for p in other_paths:
-        if p in seen:
+        if p in seen_other:
             continue
-        seen.add(p)
+        seen_other.add(p)
         dedup_other.append(p)
 
     return graph_paths, dedup_other
 
 
-def _draw_figure_page(c: "canvas.Canvas", width: float, height: float,
-                      img_path: str, fig_index: int):
+def _draw_figure_page(
+    c: "canvas.Canvas",
+    width: float,
+    height: float,
+    img_path: str,
+    fig_index: int,
+) -> None:
     """
     Render a single figure as a full-width page.
     """
@@ -514,12 +658,17 @@ def _draw_figure_page(c: "canvas.Canvas", width: float, height: float,
     except Exception as e:
         c.setFont("Helvetica", 9)
         c.setFillColor(colors.red)
-        c.drawString(margin_x, height - margin_top - 16, f"[export] Failed to render figure: {e}")
+        c.drawString(
+            margin_x,
+            height - margin_top - 16,
+            f"[export] Failed to render figure: {e}",
+        )
         c.setFillColor(colors.black)
 
 
-def _render_graph_progression(c: "canvas.Canvas", width: float, height: float,
-                              graph_paths: List[str]):
+def _render_graph_progression(
+    c: "canvas.Canvas", width: float, height: float, graph_paths: List[str]
+) -> None:
     """
     Render graph_*.png snapshots as a grid of smaller panels that show
     the evolution of the graph as a progression.
@@ -541,7 +690,7 @@ def _render_graph_progression(c: "canvas.Canvas", width: float, height: float,
     idx = 0
     fig_counter = 1
 
-    for page in range(total_pages):
+    for _page in range(total_pages):
         c.showPage()
         c.setFont("Helvetica-Bold", 13)
         c.drawString(72, height - margin_top + 8, "Graph progression snapshots")
@@ -563,7 +712,6 @@ def _render_graph_progression(c: "canvas.Canvas", width: float, height: float,
                 cell_x0 = margin_x + col * cell_w
                 cell_y_top = height - margin_top - 20 - r * cell_h
 
-                # Panel title: graph size or label
                 base = os.path.basename(img_path)
                 label = base.replace("graph_", "").replace(".png", "")
                 c.setFont("Helvetica", 7)
@@ -614,15 +762,12 @@ def _render_graph_progression(c: "canvas.Canvas", width: float, height: float,
                 break
 
 
-def _render_all_figures(c: "canvas.Canvas", width: float, height: float,
-                        out_dir: str):
+def _render_all_figures(c: "canvas.Canvas", width: float, height: float, out_dir: str):
     """
     Add figure pages to the PDF:
 
-      - Graph progression snapshots (graph_*.png in run root) as smaller
-        panels in a grid, ordered by graph size.
-      - All other PNG figures (persistence, stability, export graphs, etc)
-        as full-width one-per-page pages.
+      - Graph progression snapshots as a grid.
+      - All other PNG figures as full-width, one-per-page.
     """
     fig_paths = _collect_figure_paths(out_dir)
     if not fig_paths:
@@ -630,11 +775,9 @@ def _render_all_figures(c: "canvas.Canvas", width: float, height: float,
 
     graph_paths, other_paths = _split_graph_and_other_figs(out_dir, fig_paths)
 
-    # Graph progression as panel grids
     if graph_paths:
         _render_graph_progression(c, width, height, graph_paths)
 
-    # Remaining figures as full-width pages
     fig_idx = 1
     for p in other_paths:
         _draw_figure_page(c, width, height, p, fig_idx)
@@ -646,7 +789,7 @@ def _render_all_figures(c: "canvas.Canvas", width: float, height: float,
 # -------------------------------------------------------------------------#
 def export_summary_pdf(out_dir: str):
     """
-    Build a multi-section, stage-annotated PDF summary of the run.
+    Build a multi-part, pedagogically structured PDF summary of the run.
     Falls back to a text summary if ReportLab is unavailable.
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -659,6 +802,10 @@ def export_summary_pdf(out_dir: str):
     num_spans = _read_num_spans(out_dir)
     info_mean, mis_mean, dis_mean = _read_regime_profile(out_dir)
     compound_contexts_available = _has_compound_contexts(out_dir)
+
+    compound_stab_df = _read_compound_stability_table(out_dir)
+    lm_metrics = _read_lm_metrics(out_dir)
+    graph_metrics = _read_graph_metrics(out_dir)
 
     stage_rows = _extract_stage_rows(run_summary)
     dialectic_edges = _extract_dialectic_edges(run_summary)
@@ -697,9 +844,12 @@ def export_summary_pdf(out_dir: str):
             if root_stats.get("num_roots") is not None:
                 f.write("\nCondensed root field:\n")
                 f.write(
-                    f"  Root elements: {root_stats['num_roots']} "
-                    f"(median cluster size={root_stats.get('median_cluster_size', 'n/a')}, "
-                    f"max cluster size={root_stats.get('max_cluster_size', 'n/a')})\n"
+                    "  Root elements: {nr} (median cluster size={med}, "
+                    "max cluster size={mx})\n".format(
+                        nr=root_stats["num_roots"],
+                        med=root_stats.get("median_cluster_size", "n/a"),
+                        mx=root_stats.get("max_cluster_size", "n/a"),
+                    )
                 )
 
             if compound_stats:
@@ -708,7 +858,7 @@ def export_summary_pdf(out_dir: str):
                     f.write(f"  Compounds formed: {compound_stats['num_compounds']}\n")
                 if "mean_stability" in compound_stats:
                     f.write(
-                        f"  Mean compound stability: "
+                        "  Mean compound stability: "
                         f"{compound_stats['mean_stability']:.3f}\n"
                     )
                 if "stability_range" in compound_stats:
@@ -737,18 +887,20 @@ def export_summary_pdf(out_dir: str):
                         f"  - {a['name']} (kind={a['kind']}): {a['path']}\n"
                     )
 
-        print("[export][warn] reportlab not available; wrote text summary.")
+        print("[export][warn] reportlab not available - wrote text summary.")
         return
 
     # ------------------------------------------------------------------#
-    # PDF rendering
+    # PDF rendering - pedagogical structure
     # ------------------------------------------------------------------#
     pdf_path = os.path.join(out_dir, "hilbert_summary.pdf")
     c = canvas.Canvas(pdf_path, pagesize=A4)
     width, height = A4
     y = height - 72
 
-    # Title
+    # ===========================
+    # Part I - Orientation
+    # ===========================
     c.setFont("Helvetica-Bold", 16)
     c.drawString(72, y, title)
     y -= 20
@@ -762,16 +914,117 @@ def export_summary_pdf(out_dir: str):
     c.drawString(72, y, f"Results folder: {results_dir}")
     y -= 24
 
-    # Settings
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(72, y, "Pipeline Settings")
-    y -= 16
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Part I - How to read this report")
+    y -= 18
+    c.setFont("Helvetica", 9)
+    lines = [
+        "This report summarizes a Hilbert Information Chemistry analysis.",
+        "You can read it in layers, from beginner friendly explanations at the start",
+        "to more technical details and figures later.",
+        "",
+        "Key ideas:",
+        "  • Corpus: the set of documents or code you analyzed.",
+        "  • Span: a short text unit (for example a sentence or clause).",
+        "  • Element: a recurring informational pattern in the corpus, similar to a token",
+        "    but enriched with semantic and stability properties.",
+        "  • Molecule: a small cluster of elements that frequently co occur and form a",
+        "    meaningful structure.",
+        "  • Compound: a higher level grouping of molecules that behave as a coherent",
+        "    informational unit over the corpus.",
+    ]
+    for line in lines:
+        c.drawString(72, y, line)
+        y -= 12
+        if y < 96:
+            c.showPage()
+            y = height - 72
+            c.setFont("Helvetica", 9)
+
+    y -= 6
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(72, y, "What you can learn from this run")
+    y -= 14
+    c.setFont("Helvetica", 9)
+    lines2 = [
+        "  • How complex and diverse the informational field is (entropy, coherence).",
+        "  • How the corpus balances informational, misinformational, and disinformational",
+        "    tendencies (regime composition).",
+        "  • How tightly elements connect into a graph and which communities emerge.",
+        "  • How stable the resulting compounds are over the corpus.",
+        "  • Which key visual structures appear in the graph and persistence field.",
+    ]
+    for line in lines2:
+        c.drawString(72, y, line)
+        y -= 12
+        if y < 96:
+            c.showPage()
+            y = height - 72
+            c.setFont("Helvetica", 9)
+
+    # ===========================
+    # Part II - Pipeline overview
+    # ===========================
+    if y < 180:
+        c.showPage()
+        y = height - 72
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Part II - Overview of the Hilbert pipeline")
+    y -= 18
+    c.setFont("Helvetica", 9)
+    c.drawString(72, y, "The pipeline is a sequence of stages. Each stage transforms the data in a specific way.")
+    y -= 12
+
+    # Explain major stages in simple language
+    overview_lines = [
+        "  1. LSA spectral field:",
+        "     The system builds a semantic map of the corpus, where similar spans sit",
+        "     close together. This is the foundation for all later structure.",
+        "",
+        "  2. Span - element fusion:",
+        "     Spans are linked to informational elements, so that we can track how each",
+        "     element appears in context.",
+        "",
+        "  3. Graph and molecules:",
+        "     Elements that co occur form edges in a graph. Clusters of tightly connected",
+        "     elements are called molecules.",
+        "",
+        "  4. Compounds and stability:",
+        "     Molecules are grouped into compounds. Stability metrics estimate how robust",
+        "     these structures are across the corpus.",
+        "",
+        "  5. Regimes and signatures:",
+        "     If labels are available, the system estimates whether elements behave as",
+        "     informational, misinformational, or disinformational.",
+        "",
+        "  6. Language model scoring:",
+        "     A language model (here, via Ollama) is used to measure how surprising the",
+        "     corpus looks in aggregate (perplexity).",
+        "",
+        "  7. Visual outputs and export:",
+        "     Graph snapshots, persistence fields, and summary tables are collected into",
+        "     this PDF and a compact ZIP archive.",
+    ]
+    for line in overview_lines:
+        c.drawString(72, y, line)
+        y -= 12
+        if y < 96:
+            c.showPage()
+            y = height - 72
+            c.setFont("Helvetica", 9)
+
+    # Quick pipeline settings block
+    y -= 6
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(72, y, "Pipeline configuration for this run")
+    y -= 14
     c.setFont("Helvetica", 9)
     if settings:
         for k, v in sorted(settings.items()):
             c.drawString(84, y, f"{k}: {v}")
             y -= 12
-            if y < 120:
+            if y < 96:
                 c.showPage()
                 y = height - 72
                 c.setFont("Helvetica", 9)
@@ -779,21 +1032,30 @@ def export_summary_pdf(out_dir: str):
         c.drawString(84, y, "(no settings recorded)")
         y -= 14
 
-    y -= 4
+    # ===========================
+    # Part III - Core metrics
+    # ===========================
+    if y < 200:
+        c.showPage()
+        y = height - 72
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Part III - Core quantitative metrics")
+    y -= 20
 
     # Corpus summary
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(72, y, "Corpus Summary")
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(72, y, "Corpus summary")
     y -= 16
     c.setFont("Helvetica", 10)
-    lines = [
+    corpus_lines = [
         f"Total spans analyzed: {num_spans or 'n/a'}",
         f"Unique informational elements: {elem_info.get('num_elements', 'n/a')}",
         f"Distinct element tokens: {elem_info.get('num_tokens', 'n/a')}",
-        f"Mean element entropy: {elem_info.get('mean_entropy', 0.0):.3f}",
-        f"Mean element coherence: {elem_info.get('mean_coherence', 0.0):.3f}",
+        f"Mean element entropy (variation): {elem_info.get('mean_entropy', 0.0):.3f}",
+        f"Mean element coherence (alignment): {elem_info.get('mean_coherence', 0.0):.3f}",
     ]
-    for line in lines:
+    for line in corpus_lines:
         c.drawString(84, y, line)
         y -= 14
         if y < 120:
@@ -801,71 +1063,165 @@ def export_summary_pdf(out_dir: str):
             y = height - 72
             c.setFont("Helvetica", 10)
 
+    # Short explanation of entropy and coherence
+    y -= 4
+    c.setFont("Helvetica", 8)
+    c.drawString(
+        84,
+        y,
+        "Interpretation: entropy measures how spread out and diverse the elements are;",
+    )
+    y -= 10
+    c.drawString(
+        84,
+        y,
+        "coherence measures how tightly they cluster into consistent topics.",
+    )
+    y -= 16
+
     # Condensed root field
     if root_stats.get("num_roots") is not None:
-        y -= 4
         c.setFont("Helvetica-Bold", 11)
-        c.drawString(72, y, "Condensed Element Roots")
+        c.drawString(72, y, "Condensed element root field")
         y -= 14
         c.setFont("Helvetica", 9)
         c.drawString(
             84,
             y,
-            f"Root elements: {root_stats['num_roots']} "
-            f"(median cluster size={root_stats.get('median_cluster_size', 'n/a')}, "
-            f"max cluster size={root_stats.get('max_cluster_size', 'n/a')})",
+            (
+                f"Root elements: {root_stats['num_roots']} "
+                f"(median cluster size={root_stats.get('median_cluster_size', 'n/a')}, "
+                f"max cluster size={root_stats.get('max_cluster_size', 'n/a')})"
+            ),
         )
         y -= 14
         if root_stats.get("has_cluster_metrics"):
             c.drawString(
                 84,
                 y,
-                "Detailed cluster metrics: element_cluster_metrics.json",
+                "Detailed cluster metrics are available in element_cluster_metrics.json.",
             )
             y -= 14
+        y -= 4
 
-    # Compound field summary
-    if compound_stats:
-        if y < 120:
+    # Graph and LM metrics
+    has_graph = any(v is not None for v in graph_metrics.values())
+    has_lm = bool(lm_metrics)
+
+    if has_graph or has_lm:
+        if y < 200:
             c.showPage()
             y = height - 72
-        y -= 4
+
         c.setFont("Helvetica-Bold", 11)
-        c.drawString(72, y, "Compound Field Summary")
-        y -= 14
+        c.drawString(72, y, "Graph structure and language model metrics")
+        y -= 16
         c.setFont("Helvetica", 9)
-        if "num_compounds" in compound_stats:
-            c.drawString(
-                84,
-                y,
-                f"Compounds formed: {compound_stats['num_compounds']}",
+
+        if has_graph:
+            gm = graph_metrics
+            base_line = (
+                f"Graph nodes (elements): {gm.get('num_nodes', 'n/a')}  "
+                f"edges (co-occurrences): {gm.get('num_edges', 'n/a')}"
             )
-            y -= 12
-        if "mean_stability" in compound_stats:
-            c.drawString(
-                84,
-                y,
-                f"Mean compound stability: "
-                f"{compound_stats['mean_stability']:.3f}",
-            )
-            y -= 12
-        if "stability_range" in compound_stats:
-            lo, hi = compound_stats["stability_range"]
-            c.drawString(
-                84,
-                y,
-                f"Stability range: {float(lo):.3f} - {float(hi):.3f}",
-            )
+            if gm.get("avg_degree") is not None:
+                base_line += f"  avg degree: {gm['avg_degree']:.2f}"
+            c.drawString(84, y, base_line)
             y -= 12
 
+            if gm.get("num_components") is not None:
+                c.drawString(
+                    84,
+                    y,
+                    f"Connected components: {gm['num_components']}",
+                )
+                y -= 12
+
+            if gm.get("num_communities") is not None:
+                mod_q = gm.get("modularity")
+                if mod_q is not None:
+                    c.drawString(
+                        84,
+                        y,
+                        (
+                            f"Communities (Louvain-like): {gm['num_communities']} "
+                            f"(modularity Q={mod_q:.3f})"
+                        ),
+                    )
+                else:
+                    c.drawString(
+                        84,
+                        y,
+                        f"Communities (Louvain-like): {gm['num_communities']}",
+                    )
+                y -= 12
+
+            y -= 4
+            c.setFont("Helvetica", 8)
+            c.drawString(
+                84,
+                y,
+                "Interpretation: more edges and higher average degree indicate a denser",
+            )
+            y -= 10
+            c.drawString(
+                84,
+                y,
+                "informational graph. Modularity captures how strongly the graph splits",
+            )
+            y -= 10
+            c.drawString(
+                84,
+                y,
+                "into well defined communities of elements.",
+            )
+            y -= 14
+            c.setFont("Helvetica", 9)
+
+        if has_lm:
+            lm_model = lm_metrics.get("model", "n/a")
+            lm_ppl = lm_metrics.get("perplexity")
+            lm_tokens = lm_metrics.get("n_tokens")
+
+            c.drawString(84, y, f"Language model used (Ollama): {lm_model}")
+            y -= 12
+            if lm_ppl is not None:
+                c.drawString(
+                    84,
+                    y,
+                    f"Corpus sample perplexity: {lm_ppl:.3f}",
+                )
+                y -= 12
+            if lm_tokens is not None:
+                c.drawString(
+                    84,
+                    y,
+                    f"Tokens scored: {lm_tokens}",
+                )
+                y -= 12
+
+            c.setFont("Helvetica", 8)
+            c.drawString(
+                84,
+                y,
+                "Perplexity is a measure of how surprising the corpus is for the model:",
+            )
+            y -= 10
+            c.drawString(
+                84,
+                y,
+                "lower values suggest the corpus fits the model's expectations more closely.",
+            )
+            y -= 16
+            c.setFont("Helvetica", 9)
+
     # Regime composition chart
-    y -= 6
-    if y < 160:
+    if y < 200:
         c.showPage()
         y = height - 72
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(72, y, "Mean Regime Composition")
-    y -= 26
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(72, y, "Mean regime composition")
+    y -= 22
 
     total_reg = info_mean + mis_mean + dis_mean
     if total_reg > 0:
@@ -889,37 +1245,259 @@ def export_summary_pdf(out_dir: str):
             c.setFillColor(colors.black)
             y -= (bar_height + 6)
         y -= 10
+
+        c.setFont("Helvetica", 8)
+        c.drawString(
+            84,
+            y,
+            "These values summarize how elements behave on average across the corpus.",
+        )
+        y -= 12
     else:
         c.setFont("Helvetica", 9)
-        c.drawString(84, y, "Regime signals not available.")
+        c.drawString(84, y, "Regime signals not available for this run.")
         y -= 18
+
+    # ===========================
+    # Part IV - Compounds and stability
+    # ===========================
+    if y < 180:
+        c.showPage()
+        y = height - 72
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Part IV - Compounds and stability")
+    y -= 20
+    c.setFont("Helvetica", 9)
+    c.drawString(
+        72,
+        y,
+        "Compounds are higher level structures built from molecules of elements.",
+    )
+    y -= 12
+    c.drawString(
+        72,
+        y,
+        "Stability measures how robust these compounds are across the corpus.",
+    )
+    y -= 16
+
+    # Compound field summary
+    if compound_stats or (not compound_stab_df.empty):
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(72, y, "Compound field summary")
+        y -= 14
+        c.setFont("Helvetica", 9)
+        if compound_stats:
+            if "num_compounds" in compound_stats:
+                c.drawString(
+                    84,
+                    y,
+                    f"Compounds formed: {compound_stats['num_compounds']}",
+                )
+                y -= 12
+            if "mean_stability" in compound_stats:
+                c.drawString(
+                    84,
+                    y,
+                    (
+                        "Mean compound stability (aggregate): "
+                        f"{compound_stats['mean_stability']:.3f}"
+                    ),
+                )
+                y -= 12
+            if "stability_range" in compound_stats:
+                lo, hi = compound_stats["stability_range"]
+                c.drawString(
+                    84,
+                    y,
+                    f"Stability range across compounds: {float(lo):.3f} - {float(hi):.3f}",
+                )
+                y -= 12
+
+        if not compound_stab_df.empty and "mean_element_stability" in compound_stab_df.columns:
+            mean_stab = _safe_mean(
+                compound_stab_df["mean_element_stability"], default=0.0
+            )
+            c.drawString(
+                84,
+                y,
+                f"Mean per-element stability within compounds: {mean_stab:.3f}",
+            )
+            y -= 12
+
+        c.setFont("Helvetica", 8)
+        c.drawString(
+            84,
+            y,
+            "Higher stability indicates that the same combinations of elements recur",
+        )
+        y -= 10
+        c.drawString(
+            84,
+            y,
+            "consistently across the corpus, rather than appearing only once.",
+        )
+        y -= 16
 
     # Compound contexts
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(72, y, "Compound Contexts")
+    c.drawString(72, y, "Compound contexts")
     y -= 14
     c.setFont("Helvetica", 9)
     if compound_contexts_available:
         c.drawString(
             84,
             y,
-            "Compound contexts generated (see compound_contexts.json).",
+            "Compound contexts were generated (see compound_contexts.json) and can be",
         )
+        y -= 12
+        c.drawString(
+            84,
+            y,
+            "used to inspect typical spans that give rise to each compound.",
+        )
+        y -= 14
     else:
         c.drawString(
             84,
             y,
             "Compound contexts were not generated for this run.",
         )
+        y -= 14
+
+    # Top compounds by stability table
+    has_compound_stab = (
+        not compound_stab_df.empty
+        and "mean_element_stability" in compound_stab_df.columns
+    )
+    has_compounds_json = (
+        not compounds_df.empty and "compound_stability" in compounds_df.columns
+    )
+
+    if has_compound_stab or has_compounds_json:
+        if y < 220:
+            c.showPage()
+            y = height - 72
+
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(72, y, "Top compounds by stability")
+        y -= 18
+
+        # Primary: compound_stability.csv
+        if has_compound_stab:
+            df = compound_stab_df.copy()
+            cols = [
+                "compound_id",
+                "n_elements",
+                "mean_element_stability",
+                "stability_variance",
+                "mean_element_coherence",
+            ]
+            available_cols = [cname for cname in cols if cname in df.columns]
+
+            top_df = (
+                df.dropna(subset=["mean_element_stability"])
+                .sort_values("mean_element_stability", ascending=False)
+                .head(10)[available_cols]
+            )
+
+            if not top_df.empty:
+                data = [available_cols] + [
+                    [str(val)[:12] for val in row] for row in top_df.to_numpy()
+                ]
+
+                table = Table(
+                    data,
+                    colWidths=[1.1 * inch] * len(available_cols),
+                )
+                style = TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 8),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ]
+                )
+                table.setStyle(style)
+                table_height = (len(data) + 1) * 12
+                table.wrapOn(c, width, table_height)
+                table.drawOn(c, 72, max(80, y - table_height))
+                y = max(80, y - table_height - 20)
+            else:
+                c.setFont("Helvetica", 9)
+                c.drawString(
+                    84,
+                    y,
+                    "No per compound stability records available for table view.",
+                )
+                y -= 14
+
+        # Fallback: informational_compounds.json
+        elif has_compounds_json:
+            cols = [
+                "compound_id",
+                "num_elements",
+                "num_bonds",
+                "compound_stability",
+                "mean_temperature",
+            ]
+            available_cols = [col for col in cols if col in compounds_df.columns]
+
+            top_df = (
+                compounds_df.dropna(subset=["compound_stability"])
+                .sort_values("compound_stability", ascending=False)
+                .head(10)[available_cols]
+            )
+
+            if not top_df.empty:
+                data = [available_cols] + [
+                    [str(x)[:12] for x in row] for row in top_df.to_numpy()
+                ]
+
+                table = Table(
+                    data,
+                    colWidths=[1.1 * inch] * len(available_cols),
+                )
+                style = TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 8),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ]
+                )
+                table.setStyle(style)
+                table_height = (len(data) + 1) * 12
+                table.wrapOn(c, width, table_height)
+                table.drawOn(c, 72, max(80, y - table_height))
+                y = max(80, y - table_height - 20)
+            else:
+                c.setFont("Helvetica", 9)
+                c.drawString(
+                    84,
+                    y,
+                    "No per compound stability records available for table view.",
+                )
+                y -= 14
+
+    # ===========================
+    # Part V - Pipeline structure and artifacts
+    # ===========================
+    if y < 200:
+        c.showPage()
+        y = height - 72
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Part V - Pipeline stages, dialectic structure, and artifacts")
     y -= 20
 
     # Stages and timeline
     if stage_rows:
-        if y < 180:
-            c.showPage()
-            y = height - 72
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(72, y, "Pipeline Stages and Timeline")
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(72, y, "Pipeline stages and timeline")
         y -= 18
 
         headers = ["Stage", "Role", "Status", "Duration (s)"]
@@ -942,7 +1520,10 @@ def export_summary_pdf(out_dir: str):
                 ]
             )
 
-        table = Table(data, colWidths=[2.1 * inch, 1.0 * inch, 1.1 * inch, 1.0 * inch])
+        table = Table(
+            data,
+            colWidths=[2.1 * inch, 1.0 * inch, 1.1 * inch, 1.0 * inch],
+        )
         style = TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -959,15 +1540,35 @@ def export_summary_pdf(out_dir: str):
         table.drawOn(c, 72, max(80, y - table_height))
         y = max(80, y - table_height - 16)
 
+        c.setFont("Helvetica", 8)
+        c.drawString(
+            72,
+            y,
+            "Each stage either generates evidence, restructures data, computes stability,",
+        )
+        y -= 10
+        c.drawString(
+            72,
+            y,
+            "assesses epistemic signatures, builds visualizations, or exports results.",
+        )
+        y -= 16
+
     # Dialectic structure summary
     if dialectic_edges:
         if y < 160:
             c.showPage()
             y = height - 72
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(72, y, "Dialectic Structure Summary")
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(72, y, "Dialectic structure summary")
         y -= 16
         c.setFont("Helvetica", 9)
+        c.drawString(
+            72,
+            y,
+            "The pipeline stages can support or challenge each other conceptually.",
+        )
+        y -= 12
         for etype, edges in sorted(dialectic_edges.items()):
             c.drawString(84, y, f"Edge type: {etype} (n = {len(edges)})")
             y -= 12
@@ -993,8 +1594,8 @@ def export_summary_pdf(out_dir: str):
         if y < 160:
             c.showPage()
             y = height - 72
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(72, y, "Pipeline Artifacts")
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(72, y, "Pipeline artifacts")
         y -= 18
         c.setFont("Helvetica", 8)
         for a in artifact_rows:
@@ -1006,60 +1607,6 @@ def export_summary_pdf(out_dir: str):
                 y = height - 72
                 c.setFont("Helvetica", 8)
 
-    # Top compounds
-    if not compounds_df.empty and "compound_stability" in compounds_df.columns:
-        if y < 200:
-            c.showPage()
-            y = height - 72
-
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(72, y, "Top Compounds by Stability")
-        y -= 18
-
-        cols = [
-            "compound_id",
-            "num_elements",
-            "num_bonds",
-            "compound_stability",
-            "mean_temperature",
-        ]
-        available_cols = [col for col in cols if col in compounds_df.columns]
-
-        top_df = (
-            compounds_df.dropna(subset=["compound_stability"])
-            .sort_values("compound_stability", ascending=False)
-            .head(10)[available_cols]
-        )
-
-        if not top_df.empty:
-            data = [available_cols] + [
-                [str(x)[:12] for x in row] for row in top_df.to_numpy()
-            ]
-
-            table = Table(data, colWidths=[1.1 * inch] * len(available_cols))
-            style = TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ]
-            )
-            table.setStyle(style)
-            table_height = (len(data) + 1) * 12
-            table.wrapOn(c, width, table_height)
-            table.drawOn(c, 72, max(80, y - table_height))
-            y = max(80, y - table_height - 20)
-        else:
-            c.setFont("Helvetica", 9)
-            c.drawString(
-                84,
-                y,
-                "No per-compound stability records available for table view.",
-            )
-            y -= 14
-
     # Footer on last text page
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColor(colors.darkgray)
@@ -1070,7 +1617,9 @@ def export_summary_pdf(out_dir: str):
     )
     c.setFillColor(colors.black)
 
-    # Figure pages: graph progression panels + other figures
+    # ===========================
+    # Part VI - Visual appendix
+    # ===========================
     _render_all_figures(c, width, height, out_dir)
 
     c.save()
@@ -1097,6 +1646,8 @@ def export_zip(out_dir: str):
         "element_descriptions.json",
         "informational_compounds.json",
         "compound_metrics.json",
+        "compound_stability.csv",
+        "lm_metrics.json",
         "element_roots.csv",
         "element_clusters.json",
         "element_cluster_metrics.json",
@@ -1132,7 +1683,7 @@ def run_full_export(out_dir: str, emit=DEFAULT_EMIT) -> None:
     """
     High level export routine used by the orchestrator stage.
 
-    - Builds an integrated PDF summary of the run.
+    - Builds an integrated, pedagogically structured PDF summary.
     - Creates a ZIP archive with key artifacts.
     - Emits lightweight stage events for the API.
     """

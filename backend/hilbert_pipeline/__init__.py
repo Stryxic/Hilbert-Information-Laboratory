@@ -143,6 +143,11 @@ except Exception as exc:
         return 0.0
 
 
+#Meta
+
+from hilbert_pipeline.corpus_probe import probe_corpus, run_lsa_seed_profile
+
+
 # ======================================================================
 # Public API
 # ======================================================================
@@ -200,3 +205,7 @@ __all__ += ["build_element_edges"]
 # backend/hilbert_pipeline/__init__.py
 from .ollama_lm import compute_corpus_perplexity  # new export
 __all__ += ["compute_corpus_perplexity"]
+
+from .corpus_probe import probe_corpus, run_lsa_seed_profile
+
+__all__ += ["probe_corpus", "run_lsa_seed_profile"]

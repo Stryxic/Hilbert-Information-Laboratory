@@ -512,13 +512,32 @@ def compute_lsa_embeddings(
     if not spans:
         return np.zeros((0, 0), dtype=float), [], None
 
+    # Number of "documents" as seen by TfidfVectorizer:
+    # here each span is treated as a document.
+    n_docs = len(spans)
+
+    # Choose min_df / max_df as *absolute counts* and ensure consistency.
+    # - For a single-span corpus we must allow terms that occur in that span.
+    # - For larger corpora we keep a light filter but always enforce
+    #   max_df >= min_df so scikit-learn never raises.
+    if n_docs <= 1:
+        min_df = 1
+        max_df = 1
+    else:
+        # keep terms that appear in at least 2 spans,
+        # and do not drop anything by upper frequency
+        min_df = 2
+        max_df = n_docs  # absolute doc count, always >= min_df
+
     vectorizer = TfidfVectorizer(
         tokenizer=extract_elements_from_text,
         lowercase=True,
         token_pattern=None,  # we use a custom tokenizer
         max_features=max_vocab,
-        min_df=2,  # drop elements that occur in only one span
+        min_df=min_df,
+        max_df=max_df,
     )
+
     X = vectorizer.fit_transform(spans)  # (n_spans, n_terms)
 
     vocab = list(vectorizer.get_feature_names_out())
@@ -526,12 +545,14 @@ def compute_lsa_embeddings(
     if X.shape[1] == 0:
         return np.zeros((0, 0), dtype=float), [], vectorizer
 
+    # Do not ask for more components than min(n_docs, vocab_size) - 1
     n_components = min(n_components, max(2, min(X.shape) - 1))
 
     svd = TruncatedSVD(n_components=n_components, random_state=42)
     embeddings = svd.fit_transform(X)
 
     return embeddings.astype(float), vocab, vectorizer
+
 
 
 # =============================================================================

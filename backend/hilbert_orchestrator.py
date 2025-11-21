@@ -28,45 +28,36 @@ import pandas as pd
 # Pipeline imports (all via hilbert_pipeline public API)
 # -----------------------------------------------------------------------------
 
-
 try:
     from hilbert_pipeline import (
         DEFAULT_EMIT,
-
         # LSA
         build_lsa_field,
-
         # Element descriptions
         build_element_descriptions,
-
         # Fusion (span -> element)
         run_fusion_pipeline,
-
         # Molecules
         run_molecule_layer,
-
+        # Edges
+        build_element_edges,
         # Stability
         compute_signal_stability,
-
+        compute_compound_stability,
         # Persistence
         plot_persistence_field,
         run_persistence_visuals,
-
         # Graphs
         generate_graph_snapshots,
         export_graph_snapshots,
-
         # Epistemic signatures
         compute_signatures,
-
         # Full export (PDF + ZIP)
         run_full_export,
-
         # Element LM
         run_element_lm_stage,
-        build_element_edges,
+        # LM perplexity
         compute_corpus_perplexity,
-        compute_compound_stability, 
     )
 except Exception as exc:  # very defensive import
     raise RuntimeError(f"[orchestrator] Failed to import hilbert_pipeline: {exc}") from exc
@@ -86,6 +77,7 @@ class PipelineSettings:
 
     Keep this conservative - anything heavy should be configured per stage.
     """
+
     use_native: bool = True
     max_docs: Optional[int] = None
     random_seed: int = 13
@@ -95,6 +87,7 @@ class PipelineSettings:
 @dataclass
 class StageState:
     """Runtime state for a single stage execution."""
+
     key: str
     label: str
     status: Literal["pending", "running", "ok", "skipped", "failed"] = "pending"
@@ -123,6 +116,7 @@ class StageSpec:
         - "visual"    - builds views on the structure
         - "export"    - packages results
     """
+
     key: str
     order: float
     label: str
@@ -146,6 +140,7 @@ class PipelineContext:
     The orchestrator deals with directories, paths and coarse messages.
     Internal math lives inside hilbert_pipeline modules.
     """
+
     corpus_dir: str
     results_dir: str
     settings: PipelineSettings = field(default_factory=PipelineSettings)
@@ -240,6 +235,7 @@ class PipelineContext:
     # --- run summary --------------------------------------------------------
 
     def run_summary(self, specs: List[StageSpec]) -> Dict[str, Any]:
+        """Return a JSON-safe summary dictionary for hilbert_run.json."""
         return {
             "run_id": self.run_id,
             "corpus_dir": self.corpus_dir,
@@ -345,14 +341,13 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     # ------------------------------------------------------------------
     ctx.log("info", "[lsa] Edge generation disabled – handled by stage_edges")
 
-
-
-
     # ---------------------------------------------
     # Write LSA field (flat for compatibility)
     # ---------------------------------------------
     lsa_flat = {
-        "embeddings": emb_array.tolist() if isinstance(emb_array, np.ndarray) else emb_for_json,
+        "embeddings": emb_array.tolist()
+        if isinstance(emb_array, np.ndarray)
+        else emb_for_json,
         "span_map": span_map,
         "vocab": field.get("vocab"),
     }
@@ -360,6 +355,8 @@ def _stage_lsa(ctx: PipelineContext) -> None:
         json.dump(lsa_flat, f, indent=2)
 
     ctx.add_artifact("lsa_field.json", "lsa-field")
+
+
 def _stage_edges(ctx: PipelineContext) -> None:
     """
     Build element-element edges from span-element fusion.
@@ -370,7 +367,6 @@ def _stage_edges(ctx: PipelineContext) -> None:
     out_path = build_element_edges(ctx.results_dir, emit=ctx.emit)
     if out_path:
         ctx.add_artifact(os.path.basename(out_path), "edges")
-
 
 
 def _stage_molecules(ctx: PipelineContext) -> None:
@@ -557,16 +553,18 @@ def _stage_element_lm(ctx: PipelineContext) -> None:
         if os.path.exists(path):
             ctx.add_artifact(fname, kind)
 
+
 def _stage_lm_perplexity(ctx: PipelineContext) -> None:
     """
     LM perplexity over the corpus using Ollama logprobs.
+
     Produces:
       - lm_metrics.json
     """
     try:
         from pathlib import Path
-        out_path = Path(ctx.results_dir) / "lm_metrics.json"
 
+        out_path = Path(ctx.results_dir) / "lm_metrics.json"
 
         # Prefer preloaded text if available
         text = ctx.extras.get("corpus_text")
@@ -574,21 +572,21 @@ def _stage_lm_perplexity(ctx: PipelineContext) -> None:
         # Otherwise load spans.jsonl (default)
         if not text:
             spans_path = os.path.join(ctx.results_dir, "spans.jsonl")
-            pieces = []
+            pieces: List[str] = []
             if os.path.exists(spans_path):
                 with open(spans_path, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
                             obj = json.loads(line)
                             pieces.append(obj.get("text", ""))
-                        except:
+                        except Exception:
                             pass
             text = "\n".join(pieces)[:12000]  # Safe cap
 
-        res = compute_corpus_perplexity(
-    corpus_text=text,
-    out_path=out_path,
-)
+        compute_corpus_perplexity(
+            corpus_text=text,
+            out_path=out_path,
+        )
         ctx.add_artifact("lm_metrics.json", "lm-metrics")
 
     except Exception as exc:
@@ -633,7 +631,7 @@ STAGE_TABLE: List[StageSpec] = [
         func=_stage_fusion,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field"],           # <- removed "molecules"
+        depends_on=["lsa_field"],
         consumes=["hilbert_elements.csv"],
         produces=["span_element_fusion.csv", "compound_contexts.json"],
     ),
@@ -661,7 +659,6 @@ STAGE_TABLE: List[StageSpec] = [
         produces=["molecules.csv", "informational_compounds.json"],
         supports=["graph_snapshots"],
     ),
-
     StageSpec(
         key="stability_metrics",
         order=4.0,
@@ -686,7 +683,6 @@ STAGE_TABLE: List[StageSpec] = [
         produces=["compound_stability.csv"],
         supports=["graph_snapshots", "export_all"],
     ),
-
     StageSpec(
         key="persistence_visuals",
         order=5.0,
@@ -747,7 +743,6 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["lsa_field"],
         produces=["lm_metrics.json"],
     ),
-
     StageSpec(
         key="graph_snapshots",
         order=7.0,
@@ -818,7 +813,8 @@ def run_pipeline(
     for spec in sorted(STAGE_TABLE, key=lambda s: s.order):
         # Check hard dependencies
         unmet = [
-            d for d in spec.depends_on
+            d
+            for d in spec.depends_on
             if ctx.stages.get(d, StageState(d, d)).status != "ok"
         ]
 
