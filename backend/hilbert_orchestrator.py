@@ -1,5 +1,5 @@
 """
-Hilbert Orchestrator 3.0
+Hilbert Orchestrator 3.1
 
 Declarative, dialectical orchestration of the Hilbert information pipeline.
 
@@ -20,9 +20,45 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional
+import shutil
 
 import numpy as np
 import pandas as pd
+
+# -----------------------------------------------------------------------------
+# Optional PDF support (for corpus normalisation)
+# -----------------------------------------------------------------------------
+
+try:
+    from PyPDF2 import PdfReader  # type: ignore
+except Exception:
+    PdfReader = None
+
+
+def _pdf_to_text(path: str) -> str:
+    """
+    Very simple PDF-to-text converter.
+
+    Returns plain UTF-8 text. If conversion fails, returns empty string so the
+    caller can decide to skip the file.
+    """
+    if PdfReader is None:
+        return ""
+
+    try:
+        reader = PdfReader(path)
+        chunks: List[str] = []
+        for page in reader.pages:
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt:
+                chunks.append(txt)
+        return "\n\n".join(chunks).strip()
+    except Exception:
+        return ""
+
 
 # -----------------------------------------------------------------------------
 # Pipeline imports (all via hilbert_pipeline public API)
@@ -39,11 +75,8 @@ try:
         run_fusion_pipeline,
         # Molecules
         run_molecule_layer,
-        # Edges
-        build_element_edges,
         # Stability
         compute_signal_stability,
-        compute_compound_stability,
         # Persistence
         plot_persistence_field,
         run_persistence_visuals,
@@ -56,8 +89,9 @@ try:
         run_full_export,
         # Element LM
         run_element_lm_stage,
-        # LM perplexity
+        build_element_edges,
         compute_corpus_perplexity,
+        compute_compound_stability,
     )
 except Exception as exc:  # very defensive import
     raise RuntimeError(f"[orchestrator] Failed to import hilbert_pipeline: {exc}") from exc
@@ -77,7 +111,6 @@ class PipelineSettings:
 
     Keep this conservative - anything heavy should be configured per stage.
     """
-
     use_native: bool = True
     max_docs: Optional[int] = None
     random_seed: int = 13
@@ -87,7 +120,6 @@ class PipelineSettings:
 @dataclass
 class StageState:
     """Runtime state for a single stage execution."""
-
     key: str
     label: str
     status: Literal["pending", "running", "ok", "skipped", "failed"] = "pending"
@@ -116,7 +148,6 @@ class StageSpec:
         - "visual"    - builds views on the structure
         - "export"    - packages results
     """
-
     key: str
     order: float
     label: str
@@ -140,7 +171,6 @@ class PipelineContext:
     The orchestrator deals with directories, paths and coarse messages.
     Internal math lives inside hilbert_pipeline modules.
     """
-
     corpus_dir: str
     results_dir: str
     settings: PipelineSettings = field(default_factory=PipelineSettings)
@@ -235,7 +265,7 @@ class PipelineContext:
     # --- run summary --------------------------------------------------------
 
     def run_summary(self, specs: List[StageSpec]) -> Dict[str, Any]:
-        """Return a JSON-safe summary dictionary for hilbert_run.json."""
+        # Important: we DO NOT dump ctx.extras here to keep things JSON-safe.
         return {
             "run_id": self.run_id,
             "corpus_dir": self.corpus_dir,
@@ -257,6 +287,98 @@ class PipelineContext:
 
 
 # -----------------------------------------------------------------------------
+# Helpers for corpus normalisation (PDF + text) before LSA
+# -----------------------------------------------------------------------------
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
+    """
+    Build a normalised corpus for LSA under results_dir/_normalized_corpus:
+
+    - Converts PDFs to .txt with a simple PyPDF2-based extractor.
+    - Copies .txt/.md/.tex as UTF-8 text (ignoring binary junk).
+    - Respects settings.max_docs if set (limit on number of source files).
+    """
+    src_root = ctx.corpus_dir
+    dst_root = os.path.join(ctx.results_dir, "_normalized_corpus")
+    _ensure_dir(dst_root)
+
+    # Collect all candidate files first
+    all_paths: List[str] = []
+    for root, _, files in os.walk(src_root):
+        for fname in files:
+            all_paths.append(os.path.join(root, fname))
+
+    all_paths.sort()
+
+    max_docs = ctx.settings.max_docs or 0
+    if max_docs > 0:
+        selected_paths = all_paths[:max_docs]
+    else:
+        selected_paths = all_paths
+
+    n_converted = 0
+    n_skipped = 0
+
+    for src_path in selected_paths:
+        rel = os.path.relpath(src_path, src_root)
+        root, ext = os.path.splitext(rel)
+        ext = ext.lower()
+
+        # Destination directory (mirror structure where possible)
+        out_dir = os.path.join(dst_root, os.path.dirname(rel))
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir)
+            _ensure_dir(out_dir)
+
+        if ext == ".pdf":
+            text = _pdf_to_text(src_path)
+            if not text.strip():
+                ctx.log("warn", "[lsa] PDF produced no text; skipping", path=src_path)
+                n_skipped += 1
+                continue
+            out_name = os.path.basename(root) + ".txt"
+            out_path = os.path.join(out_dir, out_name)
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                n_converted += 1
+            except Exception as exc:
+                ctx.log("warn", "[lsa] Failed to write PDF text", path=src_path, error=str(exc))
+                n_skipped += 1
+
+        elif ext in (".txt", ".md", ".tex"):
+            out_path = os.path.join(out_dir, os.path.basename(rel))
+            try:
+                with open(src_path, "r", encoding="utf-8", errors="ignore") as f_src, \
+                        open(out_path, "w", encoding="utf-8") as f_dst:
+                    f_dst.write(f_src.read())
+                n_converted += 1
+            except Exception as exc:
+                ctx.log("warn", "[lsa] Failed to copy text file", path=src_path, error=str(exc))
+                n_skipped += 1
+        else:
+            # Ignore other file types for LSA
+            n_skipped += 1
+            continue
+
+    ctx.log(
+        "info",
+        "[lsa] Prepared normalised LSA corpus",
+        src_root=src_root,
+        dst_root=dst_root,
+        total_files=len(all_paths),
+        selected=len(selected_paths),
+        converted=n_converted,
+        skipped=n_skipped,
+    )
+    return dst_root
+
+
+# -----------------------------------------------------------------------------
 # Stage implementations (wrappers around hilbert_pipeline functions)
 # -----------------------------------------------------------------------------
 
@@ -265,20 +387,24 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     Run LSA, then write hilbert_elements.csv in a stability-compatible format.
 
     We:
-      - call build_lsa_field() to compute the spectral field
+      - normalise the corpus (PDF -> text, copy text) into _normalized_corpus
+      - call build_lsa_field() to compute the spectral field on that corpus
       - store the raw result in ctx.extras["lsa_result"]
       - export:
           * hilbert_elements.csv   (element-level table)
           * lsa_field.json         (flattened LSA field: embeddings + span_map)
     """
-    res = build_lsa_field(ctx.corpus_dir, emit=ctx.emit) or {}
+    lsa_root = _prepare_lsa_corpus(ctx)
+
+    # Important: use the same call shape as your working version
+    res = build_lsa_field(lsa_root, emit=ctx.emit) or {}
     ctx.extras["lsa_result"] = res
 
     elements = res.get("elements", []) or []
     metrics = res.get("element_metrics", []) or []
 
     field = res.get("field", {}) or {}
-    span_map = field.get("span_map", []) or []
+    span_map = field.get("span_map", [])
     embeddings = field.get("embeddings")
 
     # Convert ndarray embeddings to list-of-lists for JSON, but keep ndarray for internal use
@@ -300,8 +426,8 @@ def _stage_lsa(ctx: PipelineContext) -> None:
             {
                 "element": el,
                 "index": idx,
-                # we keep span linkage separate via span_map / fusion;
-                # these columns remain for backward compatibility
+                # span linkage handled by fusion later; these columns remain
+                # for backward compatibility
                 "span_id": -1,
                 "doc": None,
                 "text": None,
@@ -345,9 +471,7 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     # Write LSA field (flat for compatibility)
     # ---------------------------------------------
     lsa_flat = {
-        "embeddings": emb_array.tolist()
-        if isinstance(emb_array, np.ndarray)
-        else emb_for_json,
+        "embeddings": emb_array.tolist() if isinstance(emb_array, np.ndarray) else emb_for_json,
         "span_map": span_map,
         "vocab": field.get("vocab"),
     }
@@ -355,6 +479,8 @@ def _stage_lsa(ctx: PipelineContext) -> None:
         json.dump(lsa_flat, f, indent=2)
 
     ctx.add_artifact("lsa_field.json", "lsa-field")
+    ctx.stages["lsa_field"].meta["n_spans"] = len(span_map)
+    ctx.stages["lsa_field"].meta["n_elements"] = len(elements)
 
 
 def _stage_edges(ctx: PipelineContext) -> None:
@@ -379,7 +505,10 @@ def _stage_molecules(ctx: PipelineContext) -> None:
       - molecules.csv
       - informational_compounds.json (handled inside run_molecule_layer)
     """
-    mol_df, comp_df = run_molecule_layer(ctx.results_dir, emit=ctx.emit)
+    mol_df, comp_df = run_molecule_layer(
+        ctx.results_dir,
+        emit=ctx.emit
+    )
 
     # Molecule table
     if isinstance(mol_df, pd.DataFrame) and not mol_df.empty:
@@ -402,6 +531,7 @@ def _stage_fusion(ctx: PipelineContext) -> None:
 
     Delegates to hilbert_pipeline.run_fusion_pipeline(results_dir, emit).
     """
+    ctx.log("info", "[fusion] Running span→element fusion")
     run_fusion_pipeline(ctx.results_dir, emit=ctx.emit)
 
 
@@ -416,8 +546,8 @@ def _stage_stability(ctx: PipelineContext) -> None:
     elements_csv = os.path.join(ctx.results_dir, "hilbert_elements.csv")
     out_csv = os.path.join(ctx.results_dir, "signal_stability.csv")
     compute_signal_stability(
-        elements_csv=elements_csv,
-        out_csv=out_csv,
+        elements_csv,
+        out_csv,
         mode="classic",
         emit=ctx.emit,
     )
@@ -485,7 +615,7 @@ def _stage_element_labels(ctx: PipelineContext) -> None:
 
     We pass the span_map from the LSA layer (if available) for nicer contexts.
     """
-    spans = (ctx.extras.get("lsa_result") or {}).get("field", {}).get("span_map", [])
+    spans = ctx.extras.get("lsa_result", {}).get("field", {}).get("span_map", [])
     build_element_descriptions(
         elements_csv=os.path.join(ctx.results_dir, "hilbert_elements.csv"),
         spans=spans,
@@ -557,7 +687,6 @@ def _stage_element_lm(ctx: PipelineContext) -> None:
 def _stage_lm_perplexity(ctx: PipelineContext) -> None:
     """
     LM perplexity over the corpus using Ollama logprobs.
-
     Produces:
       - lm_metrics.json
     """
@@ -631,7 +760,7 @@ STAGE_TABLE: List[StageSpec] = [
         func=_stage_fusion,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field"],
+        depends_on=["lsa_field"],  # <- removed "molecules"
         consumes=["hilbert_elements.csv"],
         produces=["span_element_fusion.csv", "compound_contexts.json"],
     ),
@@ -781,10 +910,6 @@ STAGE_TABLE: List[StageSpec] = [
 # Execution engine
 # -----------------------------------------------------------------------------
 
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
 def run_pipeline(
     corpus_dir: str,
     results_dir: str,
@@ -796,6 +921,10 @@ def run_pipeline(
     `results_dir`.
 
     Returns a JSON-serialisable run summary for UI and API use.
+
+    Notes:
+    - settings.max_docs is enforced at the corpus normalisation step
+      (PDF/text selection) via _prepare_lsa_corpus.
     """
     settings = settings or PipelineSettings()
     emit = emit or DEFAULT_EMIT
@@ -813,8 +942,7 @@ def run_pipeline(
     for spec in sorted(STAGE_TABLE, key=lambda s: s.order):
         # Check hard dependencies
         unmet = [
-            d
-            for d in spec.depends_on
+            d for d in spec.depends_on
             if ctx.stages.get(d, StageState(d, d)).status != "ok"
         ]
 
@@ -864,3 +992,13 @@ def run_pipeline(
 
 # Backwards-compatible alias
 run_hilbert_pipeline = run_pipeline
+
+__all__ = [
+    "PipelineSettings",
+    "StageState",
+    "StageSpec",
+    "PipelineContext",
+    "STAGE_TABLE",
+    "run_pipeline",
+    "run_hilbert_pipeline",
+]

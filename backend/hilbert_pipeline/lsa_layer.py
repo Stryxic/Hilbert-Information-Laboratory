@@ -31,7 +31,9 @@
 #           "embeddings":  np.ndarray shape (n_spans, k),
 #           "span_map":    [ {
 #                              "doc": str,
+#                              "doc_id": int,
 #                              "span_id": int,
+#                              "position": int,
 #                              "text": str,
 #                              "elements": [str, ...],
 #                           } ],
@@ -166,7 +168,12 @@ def extract_text_from_pdf(path: Path) -> str:
                     t = ""
                 if t.strip():
                     text_chunks.append(t)
-        return "\n".join(text_chunks)
+
+        txt = "\n".join(text_chunks)
+        # De-hyphenate and merge broken lines to improve sentence segmentation
+        txt = re.sub(r"-\s*\n", "", txt)       # join hyphenated line breaks
+        txt = re.sub(r"\n(?=[a-z])", " ", txt) # join lines that continue a sentence
+        return txt
     except Exception as e:  # pragma: no cover
         print(f"[lsa] Failed to extract PDF text from {path}: {e}")
         return ""
@@ -554,7 +561,6 @@ def compute_lsa_embeddings(
     return embeddings.astype(float), vocab, vectorizer
 
 
-
 # =============================================================================
 # Main entrypoint
 # =============================================================================
@@ -591,7 +597,8 @@ def run_lsa_layer(
         "vocab":           [ ... ],
         "embeddings":      np.ndarray (n_spans, k),
         "span_map":        [
-                              { "doc": ..., "span_id": int,
+                              { "doc": ..., "doc_id": int,
+                                "span_id": int, "position": int,
                                 "text": str, "elements": [str, ...] },
                               ...
                            ],
@@ -609,9 +616,19 @@ def run_lsa_layer(
     span_map: List[Dict[str, Any]] = []
     span_id = 0
 
+    # track per-document numeric IDs and positions
+    doc_id_map: Dict[str, int] = {}
+    local_positions: Dict[str, int] = {}
+
     nlp = _get_nlp()
 
     for f in files:
+        # assign a stable doc_id per filename
+        if f.name not in doc_id_map:
+            doc_id_map[f.name] = len(doc_id_map)
+        if f.name not in local_positions:
+            local_positions[f.name] = 0
+
         text = read_and_clean(f)
         if not text:
             continue
@@ -624,19 +641,20 @@ def run_lsa_layer(
                     continue
                 if not is_informative_span(s):
                     continue
-                elems = extract_elements_from_text(s)
-                if elems is None:
-                    elems = []
+                elems = extract_elements_from_text(s) or []
                 spans.append(s)
                 span_map.append(
                     {
                         "doc": f.name,
+                        "doc_id": doc_id_map[f.name],
                         "span_id": span_id,
+                        "position": local_positions[f.name],
                         "text": s,
                         "elements": elems,
                     }
                 )
                 span_id += 1
+                local_positions[f.name] += 1
         else:
             # Fallback: split on newlines
             for line in text.splitlines():
@@ -645,19 +663,20 @@ def run_lsa_layer(
                     continue
                 if not is_informative_span(s):
                     continue
-                elems = extract_elements_from_text(s)
-                if elems is None:
-                    elems = []
+                elems = extract_elements_from_text(s) or []
                 spans.append(s)
                 span_map.append(
                     {
                         "doc": f.name,
+                        "doc_id": doc_id_map[f.name],
                         "span_id": span_id,
+                        "position": local_positions[f.name],
                         "text": s,
                         "elements": elems,
                     }
                 )
                 span_id += 1
+                local_positions[f.name] += 1
 
     if not spans:
         print("[lsa] No spans extracted; empty field.")
