@@ -80,9 +80,6 @@ try:
         # Persistence
         plot_persistence_field,
         run_persistence_visuals,
-        # Graphs
-        generate_graph_snapshots,
-        export_graph_snapshots,
         # Epistemic signatures
         compute_signatures,
         # Full export (PDF + ZIP)
@@ -296,26 +293,28 @@ def _ensure_dir(path: str) -> None:
 
 def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
     """
-    Build a normalised corpus for LSA under results_dir/_normalized_corpus:
+    Build a normalised corpus for LSA under results_dir/_normalized_corpus.
 
     - Converts PDFs to .txt with a simple PyPDF2-based extractor.
     - Copies .txt/.md/.tex as UTF-8 text (ignoring binary junk).
     - Respects settings.max_docs if set (limit on number of source files).
     """
-    src_root = ctx.corpus_dir
-    dst_root = os.path.join(ctx.results_dir, "_normalized_corpus")
-    _ensure_dir(dst_root)
+    from pathlib import Path
 
-    # Collect all candidate files first
-    all_paths: List[str] = []
-    for root, _, files in os.walk(src_root):
-        for fname in files:
-            all_paths.append(os.path.join(root, fname))
+    src_root = Path(ctx.corpus_dir).resolve()
+    dst_root = Path(ctx.results_dir).resolve() / "_normalized_corpus"
 
+    # Start from a clean scratch directory once
+    shutil.rmtree(dst_root, ignore_errors=True)
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    # Collect all candidate files
+    all_paths: List[Path] = [p for p in src_root.rglob("*") if p.is_file()]
     all_paths.sort()
 
-    max_docs = ctx.settings.max_docs or 0
-    if max_docs > 0:
+    # Apply max_docs if specified and > 0
+    max_docs = ctx.settings.max_docs
+    if max_docs is not None and max_docs > 0:
         selected_paths = all_paths[:max_docs]
     else:
         selected_paths = all_paths
@@ -324,58 +323,70 @@ def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
     n_skipped = 0
 
     for src_path in selected_paths:
-        rel = os.path.relpath(src_path, src_root)
-        root, ext = os.path.splitext(rel)
+        rel = src_path.relative_to(src_root)
+        out_dir = dst_root / rel.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        root, ext = os.path.splitext(rel.name)
         ext = ext.lower()
 
-        # Destination directory (mirror structure where possible)
-        out_dir = os.path.join(dst_root, os.path.dirname(rel))
-        if os.path.exists(out_dir):
-            shutil.rmtree(out_dir)
-            _ensure_dir(out_dir)
-
         if ext == ".pdf":
-            text = _pdf_to_text(src_path)
+            text = _pdf_to_text(str(src_path))
             if not text.strip():
-                ctx.log("warn", "[lsa] PDF produced no text; skipping", path=src_path)
+                ctx.log("warn", "[lsa] PDF produced no text; skipping", path=str(src_path))
                 n_skipped += 1
                 continue
-            out_name = os.path.basename(root) + ".txt"
-            out_path = os.path.join(out_dir, out_name)
+
+            out_name = f"{root}.txt"
+            out_path = out_dir / out_name
             try:
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(text)
                 n_converted += 1
             except Exception as exc:
-                ctx.log("warn", "[lsa] Failed to write PDF text", path=src_path, error=str(exc))
+                ctx.log(
+                    "warn",
+                    "[lsa] Failed to write PDF text",
+                    path=str(src_path),
+                    error=str(exc),
+                )
                 n_skipped += 1
 
-        elif ext in (".txt", ".md", ".tex"):
-            out_path = os.path.join(out_dir, os.path.basename(rel))
+        elif ext in (".txt", ".md", ".tex", ".py", ".c", ".h", ".cpp", ".hpp", ".cc", ".java"):
+            # For text and source files, just copy them; the LSA layer
+            # will do format-aware cleaning based on the extension.
+            out_path = out_dir / rel.name
             try:
                 with open(src_path, "r", encoding="utf-8", errors="ignore") as f_src, \
                         open(out_path, "w", encoding="utf-8") as f_dst:
                     f_dst.write(f_src.read())
                 n_converted += 1
             except Exception as exc:
-                ctx.log("warn", "[lsa] Failed to copy text file", path=src_path, error=str(exc))
+                ctx.log(
+                    "warn",
+                    "[lsa] Failed to copy text/source file",
+                    path=str(src_path),
+                    error=str(exc),
+                )
                 n_skipped += 1
         else:
-            # Ignore other file types for LSA
+            # Ignore other file types for LSA (likely binary)
             n_skipped += 1
             continue
+
 
     ctx.log(
         "info",
         "[lsa] Prepared normalised LSA corpus",
-        src_root=src_root,
-        dst_root=dst_root,
+        src_root=str(src_root),
+        dst_root=str(dst_root),
         total_files=len(all_paths),
         selected=len(selected_paths),
         converted=n_converted,
         skipped=n_skipped,
     )
-    return dst_root
+    return str(dst_root)
+
 
 
 # -----------------------------------------------------------------------------
@@ -636,34 +647,6 @@ def _stage_signatures(ctx: PipelineContext) -> None:
         ctx.add_artifact(os.path.basename(out_path), "epistemic-signatures")
 
 
-def _stage_graph_snapshots(ctx: PipelineContext) -> None:
-    """
-    Generate graph snapshots.
-
-    Relies on the hilbert_pipeline.graph_snapshots.generate_graph_snapshots
-    implementation, which reads hilbert_elements.csv / edges.csv / molecules.csv
-    from results_dir and writes PNGs (graph_*.png) into results_dir.
-    """
-    try:
-        generate_graph_snapshots(ctx.results_dir, emit=ctx.emit)
-        # The underlying module writes graph_*.png; we register the directory as a logical artifact.
-        ctx.add_artifact("graph_snapshots", "graph-snapshots", artifact_kind="directory")
-    except Exception as exc:
-        ctx.log("error", f"[graph] Snapshot generation failed: {exc}")
-
-
-def _stage_graph_export(ctx: PipelineContext) -> None:
-    """
-    Legacy graph export (DOT / PNG variants).
-
-    Delegates to export_graph_snapshots(results_dir, emit).
-    """
-    if "graph_snapshots" not in ctx.stages or ctx.stages["graph_snapshots"].status != "ok":
-        raise RuntimeError("Skipping graph_export – graph_snapshots did not run successfully")
-
-    export_graph_snapshots(ctx.results_dir, emit=ctx.emit)
-    ctx.add_artifact("graph_export", "graph-export", artifact_kind="directory")
-
 
 def _stage_element_lm(ctx: PipelineContext) -> None:
     """
@@ -738,6 +721,24 @@ def _stage_full_export(ctx: PipelineContext) -> None:
         if os.path.exists(path):
             ctx.add_artifact(fname, kind)
 
+def _stage_graph_visualizer(ctx: PipelineContext) -> None:
+    from hilbert_graphs.visualizer import HilbertGraphVisualizer
+
+    viz = HilbertGraphVisualizer(
+        ctx.results_dir,
+        emit=ctx.emit,
+    )
+    viz.run()
+
+    # register only the core artifacts for the frontend
+    for fname in [
+        "graph_full.png",
+        "graph_full_3d.png",
+        "graph_snapshots_index.json",
+    ]:
+        path = os.path.join(ctx.results_dir, fname)
+        if os.path.exists(path):
+            ctx.add_artifact(fname, "graph")
 
 # -----------------------------------------------------------------------------
 # Declarative stage table - dialectical graph definition
@@ -760,9 +761,10 @@ STAGE_TABLE: List[StageSpec] = [
         func=_stage_fusion,
         required=False,
         dialectic_role="structure",
-        depends_on=["lsa_field"],  # <- removed "molecules"
+        depends_on=["lsa_field"],
         consumes=["hilbert_elements.csv"],
         produces=["span_element_fusion.csv", "compound_contexts.json"],
+        supports=["edges"],
     ),
     StageSpec(
         key="edges",
@@ -774,7 +776,7 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["fusion"],
         consumes=["span_element_fusion.csv"],
         produces=["edges.csv"],
-        supports=["molecules", "graph_snapshots"],
+        supports=["molecules", "graph_visualizer"],
     ),
     StageSpec(
         key="molecules",
@@ -786,7 +788,7 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["edges"],
         consumes=["hilbert_elements.csv", "edges.csv"],
         produces=["molecules.csv", "informational_compounds.json"],
-        supports=["graph_snapshots"],
+        supports=["graph_visualizer"],
     ),
     StageSpec(
         key="stability_metrics",
@@ -810,7 +812,7 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["stability_metrics", "molecules"],
         consumes=["signal_stability.csv", "molecules.csv"],
         produces=["compound_stability.csv"],
-        supports=["graph_snapshots", "export_all"],
+        supports=["graph_visualizer", "export_all"],
     ),
     StageSpec(
         key="persistence_visuals",
@@ -849,7 +851,7 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["element_labels", "stability_metrics"],
         consumes=["hilbert_elements.csv", "signal_stability.csv"],
         produces=["epistemic_signatures.json"],
-        challenges=["raw_corpus"],  # conceptual node only
+        challenges=["raw_corpus"],
     ),
     StageSpec(
         key="element_lm",
@@ -872,26 +874,40 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["lsa_field"],
         produces=["lm_metrics.json"],
     ),
+
+    # ------------------------------------------------------------------
+    # NEW UNIFIED GRAPH ENGINE
+    # ------------------------------------------------------------------
     StageSpec(
-        key="graph_snapshots",
+        key="graph_visualizer",
         order=7.0,
-        label="[7] Graph snapshots",
-        func=_stage_graph_snapshots,
+        label="[7] Unified graph visualizer",
+        func=_stage_graph_visualizer,                  # NEW: calls HilbertGraphVisualizer
         required=False,
         dialectic_role="visual",
-        depends_on=["molecules"],
-        produces=["graph_snapshots"],
+        depends_on=["molecules"],                      # edges & molecules must exist
+        consumes=[
+            "hilbert_elements.csv",
+            "edges.csv",
+            "informational_compounds.json",
+        ],
+        produces=[
+            "graph_1pct.png",
+            "graph_5pct.png",
+            "graph_10pct.png",
+            "graph_25pct.png",
+            "graph_50pct.png",
+            "graph_full.png",
+            "graph_1pct_3d.png",
+            "graph_5pct_3d.png",
+            "graph_10pct_3d.png",
+            "graph_25pct_3d.png",
+            "graph_50pct_3d.png",
+            "graph_full_3d.png",
+            "graph_snapshots_index.json",
+        ],
     ),
-    StageSpec(
-        key="graph_export",
-        order=7.5,
-        label="[7.5] Graph export",
-        func=_stage_graph_export,
-        required=False,
-        dialectic_role="visual",
-        depends_on=["graph_snapshots"],
-        produces=["graph_export"],
-    ),
+
     StageSpec(
         key="export_all",
         order=8.0,
@@ -904,6 +920,7 @@ STAGE_TABLE: List[StageSpec] = [
         produces=["hilbert_summary.pdf", "hilbert_run.zip"],
     ),
 ]
+
 
 
 # -----------------------------------------------------------------------------

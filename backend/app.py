@@ -20,6 +20,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
     Query,
+    APIRouter,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
@@ -173,8 +174,8 @@ def _detect_corpus_argument() -> str:
     """
     Decide what to pass as `corpus_dir` into run_pipeline:
 
-    - If there is a single ZIP in uploaded_corpus → pass that ZIP.
-    - Otherwise → pass the directory itself.
+    - If there is a single ZIP in uploaded_corpus -> pass that ZIP.
+    - Otherwise -> pass the directory itself.
     """
     uploaded_dir = UPLOAD_BASE
     if not uploaded_dir.exists():
@@ -262,11 +263,18 @@ async def health() -> Dict[str, Any]:
     return {"status": "ok", "time": now}
 
 
+# =====================================================================
+# API router - mounted at both /api/v1 and /Hilbert-Information-Laboratory/api/v1
+# =====================================================================
+
+router = APIRouter(prefix="/api/v1")
+
+
 # ---------------------------------------------------------------------------
 # Upload corpus
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/upload_corpus")
+@router.post("/upload_corpus")
 async def upload_corpus(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
     """
     Upload corpus files (including ZIPs and PDFs).
@@ -303,7 +311,7 @@ async def upload_corpus(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
 # High-level run endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/analyze_corpus")
+@router.post("/analyze_corpus")
 async def analyze_corpus(
     max_docs: Optional[int] = Query(
         None, description="Limit number of docs via batching."
@@ -349,7 +357,7 @@ async def analyze_corpus(
     return _json_safe({"status": "ok", "summary": summary})
 
 
-@app.post("/api/v1/run_full")
+@router.post("/run_full")
 async def run_full(
     use_native: bool = Query(True, description="Use native backend if available."),
 ) -> Dict[str, Any]:
@@ -360,13 +368,13 @@ async def run_full(
     return await analyze_corpus(max_docs=None, use_native=use_native)
 
 
-@app.post("/api/v1/run_quick")
+@router.post("/run_quick")
 async def run_quick(
     max_docs: int = Query(5, description="Number of docs for a quick, batched run."),
     use_native: bool = Query(True, description="Use native backend if available."),
 ) -> Dict[str, Any]:
     """
-    Convenience endpoint: quick / batched run limited to `max_docs` documents.
+    Convenience endpoint: quick - batched run limited to `max_docs` documents.
     """
     _log("[api] run_quick", max_docs=max_docs, use_native=use_native)
     return await analyze_corpus(max_docs=max_docs, use_native=use_native)
@@ -376,7 +384,7 @@ async def run_quick(
 # Batched pipeline wrapper (multi-run fusion)
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/analyze_corpus_batched")
+@router.post("/analyze_corpus_batched")
 async def analyze_corpus_batched(
     batch_size: int = Query(5),
     use_native: bool = Query(True),
@@ -424,7 +432,7 @@ async def analyze_corpus_batched(
 # Fusion artefact endpoints (elements, molecules)
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v1/get_elements")
+@router.get("/get_elements")
 async def get_elements(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
@@ -459,47 +467,74 @@ async def get_elements(
     return {"run_id": run_dir.name, "n_elements": len(records), "elements": records}
 
 
-@app.get("/api/v1/get_molecules")
+@router.get("/get_molecules")
 async def get_molecules(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=5000),
-) -> Dict[str, Any]:
+):
     """
-    Return molecule-level records from hilbert_molecules.csv, if present.
+    Combine compound_stability.csv (metrics)
+    + informational_compounds.json (elements list)
+    into a unified molecule record.
+    """
 
-    Molecules are clusters of elements; this exposes the molecule layer
-    built by the fusion + graph stages.
-    """
     run_dir = _get_run_dir(latest=latest, run_id=run_id)
-    csv_path = run_dir / "hilbert_molecules.csv"
 
-    if not csv_path.exists():
-        _log("[molecules] hilbert_molecules.csv missing", run_dir=str(run_dir))
-        raise HTTPException(404, f"hilbert_molecules.csv not found in {run_dir}")
+    import pandas as pd
 
-    try:
-        import pandas as pd  # type: ignore
+    # --- Load metrics ---
+    stab_csv = run_dir / "compound_stability.csv"
+    if not stab_csv.exists():
+        raise HTTPException(404, "compound_stability.csv missing")
 
-        df = pd.read_csv(csv_path)
-    except Exception as exc:
-        _log("[molecules] Failed to read hilbert_molecules.csv", error=str(exc))
-        raise HTTPException(500, f"Failed to read molecules CSV: {exc}") from exc
-
-    if limit is not None and limit > 0:
+    df = pd.read_csv(stab_csv)
+    if limit:
         df = df.head(limit)
 
-    raw_records = df.to_dict(orient="records")
-    records = _json_safe(raw_records)
+    metrics = {
+        str(row["compound_id"]): row
+        for _, row in df.iterrows()
+        if "compound_id" in row
+    }
 
-    return {"run_id": run_dir.name, "n_molecules": len(records), "molecules": records}
+    # --- Load elements list ---
+    info_json = run_dir / "informational_compounds.json"
+    if info_json.exists():
+        try:
+            comp_json = json.loads(info_json.read_text())
+        except Exception:
+            comp_json = {}
+    else:
+        comp_json = {}
+
+    # JSON structure: { compound_id: { "elements": [...] } }
+    elements_map = {
+        str(k): v.get("elements", [])
+        for k, v in comp_json.items()
+    }
+
+    # --- Merge ---
+    merged = []
+    for cid, row in metrics.items():
+        rec = dict(row)
+        rec["elements"] = elements_map.get(cid, [])
+        merged.append(rec)
+
+    return {
+        "run_id": run_dir.name,
+        "n_molecules": len(merged),
+        "molecules": merged,
+    }
+
+
 
 
 # ---------------------------------------------------------------------------
-# Results & metadata endpoints
+# Results and metadata endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v1/get_results")
+@router.get("/get_results")
 async def get_results(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
@@ -526,7 +561,6 @@ async def get_results(
         except Exception as exc:
             _log("[results] Failed to read stability CSV", error=str(exc))
 
-    # JSON safe wrap
     payload = {
         "run_id": run_json.get("run_id") or run_dir.name,
         "run_summary": run_json,
@@ -536,7 +570,7 @@ async def get_results(
     return _json_safe(payload)
 
 
-@app.get("/api/v1/get_document_list")
+@router.get("/get_document_list")
 async def get_document_list(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
@@ -556,7 +590,7 @@ async def get_document_list(
     return {"run_id": run_dir.name, "documents": docs}
 
 
-@app.get("/api/v1/get_timeline_annotations")
+@router.get("/get_timeline_annotations")
 async def get_timeline_annotations(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
@@ -596,7 +630,7 @@ async def get_timeline_annotations(
 # Downloads
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v1/download_summary")
+@router.get("/download_summary")
 async def download_summary(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
@@ -612,7 +646,7 @@ async def download_summary(
     return FileResponse(str(pdf_path), filename="hilbert_summary.pdf")
 
 
-@app.get("/api/v1/download_archive")
+@router.get("/download_archive")
 async def download_archive(
     latest: bool = Query(True),
     run_id: Optional[str] = Query(None),
@@ -626,3 +660,265 @@ async def download_archive(
 
     _log("[download] Archive", path=str(zip_path))
     return FileResponse(str(zip_path), filename="hilbert_run.zip")
+
+# =============================================================================
+# Vault API Endpoints
+# =============================================================================
+
+from hilbert_pipeline.vault_manager import VaultManager
+
+VAULT_BASE = BASE_DIR / "vaults"
+VAULT_BASE.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_vault_path(vault_name: str) -> Path:
+    """Return the absolute path to a vault directory."""
+    if not vault_name:
+        raise HTTPException(400, "vault_name is required.")
+    path = VAULT_BASE / vault_name
+    return path
+
+
+@router.post("/vault/create")
+async def vault_create(vault_name: str = Body(..., embed=True)) -> Dict[str, Any]:
+    """
+    Create a new vault:
+    {
+        "vault_name": "my_vault"
+    }
+    """
+    path = _resolve_vault_path(vault_name)
+
+    if path.exists():
+        raise HTTPException(400, f"Vault '{vault_name}' already exists.")
+
+    try:
+        VaultManager.create_vault(str(path))
+    except Exception as exc:
+        _log("[vault] create failed", error=str(exc))
+        raise HTTPException(500, f"Failed to create vault: {exc}")
+
+    _log("[vault] created", name=vault_name)
+    return {"status": "ok", "vault": vault_name}
+
+
+@router.get("/vault/open")
+async def vault_open(vault_name: str = Query(...)) -> Dict[str, Any]:
+    """
+    Open a vault and return a list of notes.
+    """
+    path = _resolve_vault_path(vault_name)
+
+    if not path.exists():
+        raise HTTPException(404, f"Vault '{vault_name}' not found.")
+
+    try:
+        vm = VaultManager(str(path))
+        notes = vm.list_notes()
+    except Exception as exc:
+        _log("[vault] open failed", error=str(exc))
+        raise HTTPException(500, f"Failed to open vault: {exc}")
+
+    return {"vault": vault_name, "notes": notes}
+
+
+@router.get("/vault/get_note")
+async def vault_get_note(
+    vault_name: str = Query(...),
+    note_id: str = Query(...)
+) -> Dict[str, Any]:
+    path = _resolve_vault_path(vault_name)
+    vm = VaultManager(str(path))
+
+    try:
+        data = vm.load_note(note_id)
+    except Exception as exc:
+        raise HTTPException(404, f"Note not found: {exc}")
+
+    return data
+
+
+@router.post("/vault/create_note")
+async def vault_create_note(
+    vault_name: str = Body(...),
+    title: str = Body("Untitled")
+) -> Dict[str, Any]:
+    path = _resolve_vault_path(vault_name)
+    vm = VaultManager(str(path))
+
+    try:
+        note_id = vm.create_note(title=title)
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to create note: {exc}")
+
+    return {"status": "ok", "vault": vault_name, "note_id": note_id}
+
+
+@router.post("/vault/save_note")
+async def vault_save_note(
+    vault_name: str = Body(...),
+    note_id: str = Body(...),
+    meta: Dict[str, Any] = Body(...),
+    content: str = Body(...)
+) -> Dict[str, Any]:
+    path = _resolve_vault_path(vault_name)
+    vm = VaultManager(str(path))
+
+    try:
+        vm.save_note(note_id, meta, content)
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to save note: {exc}")
+
+    return {"status": "ok", "note_id": note_id}
+
+
+@router.delete("/vault/delete_note")
+async def vault_delete_note(
+    vault_name: str = Query(...),
+    note_id: str = Query(...)
+) -> Dict[str, Any]:
+    path = _resolve_vault_path(vault_name)
+    vm = VaultManager(str(path))
+
+    try:
+        vm.delete_note(note_id)
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to delete note: {exc}")
+
+    return {"status": "ok", "note_id": note_id}
+
+
+@router.get("/vault/search")
+async def vault_search(
+    vault_name: str = Query(...),
+    query: str = Query(...)
+) -> Dict[str, Any]:
+    path = _resolve_vault_path(vault_name)
+    vm = VaultManager(str(path))
+
+    try:
+        matches = vm.search(query)
+    except Exception as exc:
+        raise HTTPException(500, f"Search failed: {exc}")
+
+    return {"vault": vault_name, "query": query, "results": matches}
+
+
+@router.get("/vault/graph")
+async def vault_graph(vault_name: str = Query(...)) -> Dict[str, Any]:
+    """
+    Return a unified node-edge graph for the vault viewer.
+    """
+    path = _resolve_vault_path(vault_name)
+    vm = VaultManager(str(path))
+
+    try:
+        graph = vm.build_graph()
+    except Exception as exc:
+        raise HTTPException(500, f"Graph generation failed: {exc}")
+
+    return {"vault": vault_name, "graph": graph}
+
+# =====================================================================
+# Hilbert Assistant - Ollama chat endpoint
+# =====================================================================
+# Optional: Ollama client for chat / code review
+try:
+    from routes.ollama_client import call_ollama  # in backend/ollama_client.py
+except Exception:
+    call_ollama = None
+
+# ---------------------------------------------------------------------------
+# Ollama Chat Endpoint (for NotebookCanvas)
+# ---------------------------------------------------------------------------
+from pathlib import Path
+
+ROOT_DIR = BASE_DIR.parent  # you already have this
+
+def get_repo_top_dirs() -> list[str]:
+    """Return a sorted list of top-level directories in the repo root."""
+    dirs = []
+    for entry in ROOT_DIR.iterdir():
+        if entry.is_dir() and not entry.name.startswith("."):
+            # skip results / uploaded_corpus so it does not loop on its own output
+            if entry.name in {"results", "uploaded_corpus", "__pycache__"}:
+                continue
+            dirs.append(entry.name)
+    return sorted(dirs)
+
+@router.post("/ollama_chat")
+async def ollama_chat_api(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """
+    Chat endpoint behind /api/v1/ollama_chat.
+
+    Expects:
+      {
+        "messages": [
+          { "role": "user" | "assistant" | "system", "content": "<text>" },
+          ...
+        ],
+        "focus": "<optional hint about what to look at>",
+        "model": "<optional ollama model name>"
+      }
+
+    Returns:
+      { "reply": "<assistant text>" }
+    """
+    print("Calling Ollama /api/v1/ollama_chat")
+
+    if call_ollama is None:
+        _log("[api] ollama_chat unavailable - ollama_client not importable")
+        raise HTTPException(500, "Ollama client not available on this backend.")
+
+    messages = payload.get("messages") or []
+    focus = payload.get("focus")
+    model = payload.get("model")
+
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(
+            400, "Request must include a non-empty 'messages' list."
+        )
+
+    try:
+        reply_text = chat_with_hilbert(messages, focus=focus, model=model)
+    except Exception as exc:
+        _log("[api] ollama_chat failed", error=str(exc))
+        raise HTTPException(500, f"Ollama request failed: {exc}") from exc
+
+    return {"reply": reply_text}
+
+
+
+@router.get("/get_control_state")
+async def get_control_state():
+    """
+    Returns the latest control-plane snapshot:
+    - config used
+    - global field stats
+    - tuning suggestions
+    """
+    from hilbert_pipeline.run_registry import RunRegistry
+
+    registry = RunRegistry(RESULTS_BASE)
+    state = registry.load_latest()
+
+    if not state:
+        raise HTTPException(404, "No control-plane state available.")
+
+    return state
+
+
+
+# ---------------------------------------------------------------------------
+# Mount router under both base paths
+# ---------------------------------------------------------------------------
+
+# Standard base: /api/v1/...
+app.include_router(router)
+
+# GitHub Pages / Vite public base: /Hilbert-Information-Laboratory/api/v1/...
+app.include_router(router, prefix="/Hilbert-Information-Laboratory")
+
+from routes.code_review import router as code_review_router
+
+app.include_router(code_review_router)

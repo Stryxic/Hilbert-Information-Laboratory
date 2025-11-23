@@ -1,7 +1,9 @@
 # =============================================================================
-# hilbert_pipeline/fusion.py — Span-to-Element Fusion Layer (Advanced Hybrid)
+# hilbert_pipeline/fusion.py — Span-to-Element Fusion Layer (Option A)
 # =============================================================================
 """
+Option A: fusion loads hilbert_elements.csv to map element → element_id.
+
 This module enriches the Hilbert pipeline by:
 
   (1) Mapping each span embedding → nearest element embeddings
@@ -18,6 +20,13 @@ This module enriches the Hilbert pipeline by:
         ambiguity,
         mean similarity,
         entropy-weighted thresholds.
+
+Key differences in Option A:
+  - Element embeddings are always aligned with hilbert_elements.csv.
+  - We propagate a stable element identifier (element_id) taken from
+    hilbert_elements.csv (prefer 'element_id', fall back to 'index').
+  - span_element_fusion.csv now includes both 'element' (string) and
+    'element_id' (int) for downstream consistency.
 
 This version is aligned with the upgraded orchestrator & molecule layer and
 supports orchestrator event streaming via emit().
@@ -142,20 +151,48 @@ def _parse_vec(raw: Any) -> Optional[np.ndarray]:
     return None
 
 
-def _load_element_embeddings_from_csv(elements_csv: str,
-                                      emit=DEFAULT_EMIT) -> Tuple[np.ndarray, List[str]]:
+def _resolve_element_id_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    Decide which column in hilbert_elements.csv should serve as the stable
+    element identifier.
+
+    Preference:
+      1) 'element_id' (if present)
+      2) 'index'      (LSA index written by orchestrator)
+      3) None         (caller will have to fall back to row order)
+    """
+    if "element_id" in df.columns:
+        return "element_id"
+    if "index" in df.columns:
+        return "index"
+    return None
+
+
+def _load_element_embeddings_from_csv(
+    elements_csv: str,
+    emit=DEFAULT_EMIT,
+) -> Tuple[np.ndarray, List[str], List[int]]:
     """
     Primary path: load element embeddings from hilbert_elements.csv when an
-    'embedding' column is present.
+    'embedding' column is present, aligned with element → element_id.
+
+    Returns
+    -------
+    elem_vecs : np.ndarray       (n_elements, d)
+    elem_ids  : list[str]        element string labels
+    elem_idxs : list[int]        element_id / index from CSV
     """
     df = pd.read_csv(elements_csv)
     if "element" not in df.columns or "embedding" not in df.columns:
         raise ValueError("hilbert_elements.csv missing 'embedding' column.")
 
+    id_col = _resolve_element_id_column(df)
+
     el_ids: List[str] = []
+    el_indices: List[int] = []
     vecs: List[np.ndarray] = []
 
-    for _, row in df.iterrows():
+    for row_idx, row in df.iterrows():
         el = str(row["element"])
         v = _parse_vec(row["embedding"])
         if v is None:
@@ -163,7 +200,17 @@ def _load_element_embeddings_from_csv(elements_csv: str,
         v = v.astype(float)
         if not np.any(v):
             continue
+
+        if id_col is not None:
+            try:
+                el_id = int(row[id_col])
+            except Exception:
+                el_id = int(row_idx)
+        else:
+            el_id = int(row_idx)
+
         el_ids.append(el)
+        el_indices.append(el_id)
         vecs.append(v)
 
     if not el_ids:
@@ -172,14 +219,18 @@ def _load_element_embeddings_from_csv(elements_csv: str,
     X = np.vstack(vecs)
     norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
     X = X / norms
-    return X, el_ids
+    return X, el_ids, el_indices
 
 
-def _derive_element_centroids_from_span_map(lsa_path: str,
-                                            emit=DEFAULT_EMIT) -> Tuple[np.ndarray, List[str]]:
+def _derive_element_centroids_from_span_map(
+    lsa_path: str,
+    elements_csv: str,
+    emit=DEFAULT_EMIT,
+) -> Tuple[np.ndarray, List[str], List[int]]:
     """
     Fallback: derive element centroids directly from the LSA span embeddings +
-    span_map 'elements' lists.
+    span_map 'elements' lists, but align them with hilbert_elements.csv so that
+    element → element_id is consistent across the pipeline.
 
     This does NOT depend on hilbert_elements.csv containing span_id.
     """
@@ -209,15 +260,39 @@ def _derive_element_centroids_from_span_map(lsa_path: str,
             el_str = str(el)
             buckets[el_str].append(i)
 
+    # Load canonical element list + IDs from hilbert_elements.csv
+    elements_df = pd.read_csv(elements_csv)
+    if "element" not in elements_df.columns:
+        raise ValueError("hilbert_elements.csv missing 'element' column.")
+
+    id_col = _resolve_element_id_column(elements_df)
+
     el_ids: List[str] = []
+    el_indices: List[int] = []
     vecs: List[np.ndarray] = []
 
-    for el, idxs in buckets.items():
+    for row_idx, row in elements_df.iterrows():
+        el = str(row["element"])
+        idxs = buckets.get(el, [])
         if not idxs:
+            # This element never actually appears in span_map; skip it for
+            # centroid estimation. It will still exist in hilbert_elements.csv
+            # but simply won't be used in fusion similarity comparisons.
             continue
-        # mean over all span embeddings where this element appears
-        vecs.append(span_emb[idxs].mean(axis=0))
+
+        v = span_emb[idxs].mean(axis=0)
+
+        if id_col is not None:
+            try:
+                el_id = int(row[id_col])
+            except Exception:
+                el_id = int(row_idx)
+        else:
+            el_id = int(row_idx)
+
         el_ids.append(el)
+        el_indices.append(el_id)
+        vecs.append(v)
 
     if not el_ids:
         raise ValueError("No valid element centroids derived from span_map.")
@@ -225,16 +300,19 @@ def _derive_element_centroids_from_span_map(lsa_path: str,
     X = np.vstack(vecs)
     norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
     X = X / norms
-    return X, el_ids
+    return X, el_ids, el_indices
 
 
-def _load_element_embeddings(elements_csv: str,
-                             lsa_path: str,
-                             emit=DEFAULT_EMIT) -> Tuple[np.ndarray, List[str]]:
+def _load_element_embeddings(
+    elements_csv: str,
+    lsa_path: str,
+    emit=DEFAULT_EMIT,
+) -> Tuple[np.ndarray, List[str], List[int]]:
     """
     Hybrid loader:
       - first try CSV 'embedding' column
-      - if missing, fall back to LSA-derived centroids via span_map.elements
+      - if missing, fall back to LSA-derived centroids via span_map.elements,
+        always keeping element → element_id aligned with hilbert_elements.csv.
     """
     try:
         return _load_element_embeddings_from_csv(elements_csv, emit=emit)
@@ -244,7 +322,11 @@ def _load_element_embeddings(elements_csv: str,
             f"embeddings failed: {e_csv}",
             emit,
         )
-        return _derive_element_centroids_from_span_map(lsa_path, emit=emit)
+        return _derive_element_centroids_from_span_map(
+            lsa_path=lsa_path,
+            elements_csv=elements_csv,
+            emit=emit,
+        )
 
 
 # =============================================================================
@@ -276,9 +358,11 @@ def fuse_spans_to_elements(out_dir: str,
                            top_k: int = 3,
                            emit=DEFAULT_EMIT) -> pd.DataFrame:
     """
-    Produces a CSV: span_index, span_id, doc, element, similarity, threshold.
+    Produces a CSV: span_index, span_id, doc, element, element_id, similarity, threshold.
 
     Uses adaptive thresholding based on span entropy when available.
+    element_id is taken from hilbert_elements.csv (column 'element_id' if present,
+    otherwise 'index', otherwise row order).
     """
     lsa_path = os.path.join(out_dir, "lsa_field.json")
     el_path = os.path.join(out_dir, "hilbert_elements.csv")
@@ -290,7 +374,7 @@ def fuse_spans_to_elements(out_dir: str,
     # -- load embeddings & span map ------------------------------------------
     try:
         span_vecs, span_map_indexed = _load_span_embeddings(lsa_path, emit)
-        elem_vecs, elem_ids = _load_element_embeddings(el_path, lsa_path, emit)
+        elem_vecs, elem_ids, elem_indices = _load_element_embeddings(el_path, lsa_path, emit)
     except Exception as e:
         _log(f"[fusion][warn] Failed embedding load: {e}", emit)
         return pd.DataFrame()
@@ -327,6 +411,7 @@ def fuse_spans_to_elements(out_dir: str,
                 "span_id": span_id,
                 "doc": doc,
                 "element": elem_ids[j],
+                "element_id": elem_indices[j],
                 "similarity": sim,
                 "threshold": thr,
             })

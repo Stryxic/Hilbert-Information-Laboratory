@@ -71,6 +71,15 @@ except ImportError:  # pragma: no cover
     spacy = None
     _NLP = None
 
+# Optional code tokenizer backend (used for code-aware LSA)
+try:
+    from hilbert_pipeline.code_tokenizer import tokenize_code_string  # type: ignore
+
+    _HAVE_CODE_TOKENIZER = True
+except Exception:  # pragma: no cover
+    tokenize_code_string = None
+    _HAVE_CODE_TOKENIZER = False
+
 
 # =============================================================================
 # spaCy helper
@@ -171,12 +180,56 @@ def extract_text_from_pdf(path: Path) -> str:
 
         txt = "\n".join(text_chunks)
         # De-hyphenate and merge broken lines to improve sentence segmentation
-        txt = re.sub(r"-\s*\n", "", txt)       # join hyphenated line breaks
-        txt = re.sub(r"\n(?=[a-z])", " ", txt) # join lines that continue a sentence
+        txt = re.sub(r"-\s*\n", "", txt)        # join hyphenated line breaks
+        txt = re.sub(r"\n(?=[a-z])", " ", txt)  # join lines that continue a sentence
         return txt
     except Exception as e:  # pragma: no cover
         print(f"[lsa] Failed to extract PDF text from {path}: {e}")
         return ""
+
+
+# -------------------------------------------------------------------------
+# Code-aware text extraction helpers
+# -------------------------------------------------------------------------
+
+
+def _code_tokens_from_source(src: str, language: str) -> str:
+    """
+    Use the optional code tokenizer to turn source into a bag of identifier-like
+    tokens suitable for LSA. If the backend is unavailable or fails, this
+    returns an empty string and the caller simply relies on comments/docstrings.
+    """
+    if not (_HAVE_CODE_TOKENIZER and tokenize_code_string is not None):
+        return ""
+
+    try:
+        tokens = tokenize_code_string(src, language=language)
+    except TypeError:
+        # If older signature without language
+        try:
+            tokens = tokenize_code_string(src)
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+    if not tokens:
+        return ""
+
+    # Keep only simple string tokens; drop weird structured outputs.
+    cleaned: List[str] = []
+    for t in tokens:
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if not t:
+            continue
+        cleaned.append(t)
+
+    if not cleaned:
+        return ""
+
+    return " ".join(cleaned)
 
 
 def extract_text_from_python(path: Path) -> str:
@@ -186,7 +239,10 @@ def extract_text_from_python(path: Path) -> str:
     We keep:
       - comments starting with '#'
       - docstrings (triple-quoted strings)
-    and discard executable code as far as practical.
+      - PLUS a bag of code tokens from the optional code tokenizer backend
+
+    The idea is to preserve both natural-language documentation and
+    identifier-level structure for LSA.
     """
     try:
         src = path.read_text(encoding="utf-8", errors="ignore")
@@ -209,18 +265,28 @@ def extract_text_from_python(path: Path) -> str:
         if body and body.strip():
             docstrings.append(body.strip())
 
-    chunks = [*comment_lines, *docstrings]
-    text = "\n".join(chunks)
+    pieces: List[str] = []
+    comment_block = "\n".join(comment_lines + docstrings).strip()
+    if comment_block:
+        pieces.append(comment_block)
+
+    # Code token stream (identifiers etc.)
+    code_terms = _code_tokens_from_source(src, language="python")
+    if code_terms:
+        pieces.append(code_terms)
+
+    text = "\n\n".join(pieces)
     return text.strip()
 
 
 def extract_text_from_c_like(path: Path) -> str:
     """
-    Extract comments from C / C++ / Java style files.
+    Extract comments and code tokens from C / C++ / Java style files.
 
     Keeps:
       - // line comments
       - /* block comments */
+      - PLUS a bag of code tokens from the optional code tokenizer backend.
     """
     try:
         src = path.read_text(encoding="utf-8", errors="ignore")
@@ -242,8 +308,25 @@ def extract_text_from_c_like(path: Path) -> str:
         if body and body.strip():
             block_comments.append(body.strip())
 
-    chunks = [*line_comments, *block_comments]
-    text = "\n".join(chunks)
+    pieces: List[str] = []
+    comment_block = "\n".join(line_comments + block_comments).strip()
+    if comment_block:
+        pieces.append(comment_block)
+
+    # Code token stream
+    # Choose a coarse language label for the tokenizer; most backends handle
+    # "c" and "java" similarly.
+    suffix = path.suffix.lower()
+    if suffix == ".java":
+        lang = "java"
+    else:
+        lang = "c"
+
+    code_terms = _code_tokens_from_source(src, language=lang)
+    if code_terms:
+        pieces.append(code_terms)
+
+    text = "\n\n".join(pieces)
     return text.strip()
 
 
@@ -609,8 +692,8 @@ def run_lsa_layer(
     if not corpus_dir.exists():
         raise FileNotFoundError(f"Corpus directory does not exist: {corpus_dir}")
 
-    # Collect candidate files – we accept a variety of file types
-    files = sorted(p for p in corpus_dir.glob("*") if p.is_file())
+    # Collect candidate files – accept a variety of file types, recursively
+    files = sorted(p for p in corpus_dir.rglob("*") if p.is_file())
 
     spans: List[str] = []
     span_map: List[Dict[str, Any]] = []
