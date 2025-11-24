@@ -1,57 +1,64 @@
+# =============================================================================
+# hilbert_pipeline/signatures.py — Epistemic Signatures Layer (v3.1)
+# =============================================================================
 """
-signatures.py — seed layer for informational crystals (mis/disinformation)
+Computes epistemic signatures for informational elements:
 
-This module computes *epistemic signatures* for each informational element,
-based on span-level labels such as:
+    information
+    misinformation
+    disinformation
+    ambiguous
 
-    - information
-    - misinformation
-    - disinformation
-    - ambiguous / unknown
+Works with both:
+  - span-level label files (span_id → label)
+  - element-level label files (element → label)
 
-Inputs (from results_dir):
-    - hilbert_elements.csv
-    - epistemic_labels.csv  (optional, but needed for useful output)
+Outputs:
+  - signatures.csv                    (human-readable table)
+  - signatures.json                   (structured)
+  - graph_signatures_nodes.csv        (graph-contract ready)
 
-Outputs (into results_dir):
-    - signatures.csv
-    - signatures.json
-
-Each element gets:
-    - counts per label
-    - probabilities per label (Laplace-smoothed)
-    - Shannon entropy in bits
-    - dominant_label
-    - total support
-
-This is intentionally lightweight but structurally aligned with the future
-"crystal" storage: it is layer 0 of a misinfo crystal.
+This module is fully compatible with:
+  - hilbert_elements.csv (v3)
+  - orchestrator 3.1
+  - molecule and stability layers
+  - graph visualizer (contract-ready node tables)
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Callable, List
 
 import numpy as np
 import pandas as pd
 
-from . import DEFAULT_EMIT  # reuse orchestrator logging lambda if you already have one
+try:
+    from . import DEFAULT_EMIT
+except Exception:
+    DEFAULT_EMIT = lambda *_: None
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+def _log(emit, level, msg, **fields):
+    payload = {"level": level, "msg": msg}
+    payload.update(fields)
+    print(f"[{level}] {msg} {fields}")
+    try:
+        emit("log", payload)
+    except Exception:
+        pass
 
 
-def _log(msg: str, emit=DEFAULT_EMIT) -> None:
-    print(msg)
-    emit("log", {"message": msg})
+# -----------------------------------------------------------------------------
+# Canonical label mapping
+# -----------------------------------------------------------------------------
 
-
-_CANON_LABELS = {
+_CANON = {
     "information": "information",
     "info": "information",
     "true": "information",
@@ -71,180 +78,153 @@ _CANON_LABELS = {
     "unclassified": "ambiguous",
 }
 
+_LABEL_SPACE = ["information", "misinformation", "disinformation", "ambiguous"]
 
-_LABEL_ORDER = ["information", "misinformation", "disinformation", "ambiguous"]
 
-
-def _canon_label(raw: str) -> str:
-    if not isinstance(raw, str):
+def _canon_label(val: Any) -> str:
+    if not isinstance(val, str):
         return "ambiguous"
-    key = raw.strip().lower()
-    return _CANON_LABELS.get(key, "ambiguous")
+    key = val.strip().lower()
+    return _CANON.get(key, "ambiguous")
 
 
 def _shannon_entropy(probs: np.ndarray) -> float:
-    """
-    Compute Shannon entropy (bits) for a probability vector.
-    Robust to:
-        - unnormalized inputs
-        - zero entries
-        - NaNs / infs
-        - boolean accidental inputs
-    """
     probs = np.asarray(probs, dtype=float)
-
-    # Remove invalid values
-    probs = probs[np.isfinite(probs) & (probs > 0.0)]
+    probs = probs[np.isfinite(probs) & (probs > 0)]
     if probs.size == 0:
         return 0.0
-
-    # Normalise to a proper probability distribution
     total = probs.sum()
     if total <= 0:
         return 0.0
-    probs = probs / total
-
-    # Shannon entropy in bits
-    return float(-np.sum(probs * np.log2(probs)))
+    p = probs / total
+    return float(-np.sum(p * np.log2(p)))
 
 
-# ---------------------------------------------------------------------
-# Core computation
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Label loading
+# -----------------------------------------------------------------------------
+
+def _load_label_table(results_dir: str, emit) -> pd.DataFrame:
+    """
+    Loads whichever labels exist:
+        - span-level: span_id, label
+        - element-level: element, label
+
+    Accepts:
+        epistemic_labels.csv
+        misinfo_labels.csv
+        truth_intent_labels.csv
+        labels.csv
+    """
+    candidates = [
+        "epistemic_labels.csv",
+        "misinfo_labels.csv",
+        "truth_intent_labels.csv",
+        "labels.csv",
+    ]
+
+    path = None
+    for c in candidates:
+        p = os.path.join(results_dir, c)
+        if os.path.exists(p):
+            path = p
+            break
+
+    if not path:
+        _log(emit, "warn", "[signatures] No label file found", looked_for=candidates)
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        _log(emit, "warn", "[signatures] Failed to load label file", path=path, error=str(exc))
+        return pd.DataFrame()
+
+    # Detect mode
+    if "span_id" in df.columns:
+        mode = "span"
+    elif "element" in df.columns:
+        mode = "element"
+    else:
+        _log(emit, "warn", "[signatures] Label file has neither span_id nor element column", path=path)
+        return pd.DataFrame()
+
+    # Identify label column
+    label_col = None
+    for c in ["label", "epistemic_label", "truth_label", "class"]:
+        if c in df.columns:
+            label_col = c
+            break
+
+    if not label_col:
+        _log(emit, "warn", "[signatures] No usable label column detected", columns=list(df.columns))
+        return pd.DataFrame()
+
+    df = df[[col for col in df.columns if col in ("span_id", "element", label_col)]].copy()
+    df.rename(columns={label_col: "label"}, inplace=True)
+    df["label"] = df["label"].apply(_canon_label)
+
+    return df
 
 
-def _load_elements(results_dir: str, emit=DEFAULT_EMIT) -> pd.DataFrame:
+def _load_elements(results_dir: str, emit) -> pd.DataFrame:
     path = os.path.join(results_dir, "hilbert_elements.csv")
     if not os.path.exists(path):
-        _log(f"[info] hilbert_elements.csv not found at {path}", emit)
+        _log(emit, "warn", "[signatures] hilbert_elements.csv missing", path=path)
         return pd.DataFrame()
 
     df = pd.read_csv(path)
-
     if "element" not in df.columns:
         if "token" in df.columns:
             df["element"] = df["token"].astype(str)
         else:
-            _log("[info] No 'element' or 'token' column in hilbert_elements.csv", emit)
+            _log(emit, "warn", "[signatures] hilbert_elements.csv has no element column", path=path)
             return pd.DataFrame()
-
-    if "span_id" not in df.columns:
-        _log("[info] hilbert_elements.csv has no 'span_id' column; "
-             "cannot join to labels. Skipping.", emit)
-        return pd.DataFrame()
 
     df["element"] = df["element"].astype(str)
     return df
 
 
-def _load_labels(results_dir: str, emit=DEFAULT_EMIT) -> pd.DataFrame:
-    """
-    Attempt to load a span-level epistemic label file.
+# -----------------------------------------------------------------------------
+# Main computation
+# -----------------------------------------------------------------------------
 
-    We accept any CSV in results_dir called one of:
-        - epistemic_labels.csv
-        - misinfo_labels.csv
-        - truth_intent_labels.csv
-    and expect at least:
-        span_id, label
-    """
-    candidate_names = [
-        "epistemic_labels.csv",
-        "misinfo_labels.csv",
-        "truth_intent_labels.csv",
-    ]
-    path = None
-    for name in candidate_names:
-        candidate = os.path.join(results_dir, name)
-        if os.path.exists(candidate):
-            path = candidate
-            break
-
-    if path is None:
-        _log(
-            "[info] No epistemic label file found "
-            "(looked for epistemic_labels.csv / misinfo_labels.csv / truth_intent_labels.csv); "
-            "skipping misinfo signatures.",
-            emit,
-        )
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(path)
-    except Exception as exc:  # pragma: no cover - defensive
-        _log(f"[info] Failed to read label file {path}: {exc}", emit)
-        return pd.DataFrame()
-
-    if "span_id" not in df.columns:
-        _log(f"[info] Label file {path} missing 'span_id' column; skipping.", emit)
-        return pd.DataFrame()
-
-    # Choose label column
-    label_col = None
-    for cand in ["label", "epistemic_label", "truth_label", "class"]:
-        if cand in df.columns:
-            label_col = cand
-            break
-
-    if label_col is None:
-        _log(
-            f"[info] Label file {path} has no recognised label column "
-            "(expected one of: label / epistemic_label / truth_label / class); "
-            "skipping.",
-            emit,
-        )
-        return pd.DataFrame()
-
-    df = df[["span_id", label_col]].copy()
-    df.rename(columns={label_col: "label"}, inplace=True)
-    df["span_id"] = pd.to_numeric(df["span_id"], errors="coerce").astype("Int64")
-    df = df.dropna(subset=["span_id"])
-    df["span_id"] = df["span_id"].astype(int)
-    df["label"] = df["label"].apply(_canon_label)
-
-    return df
-
-
-def compute_signatures(results_dir: str, emit=DEFAULT_EMIT) -> None:
-    """
-    Public entry point used by the orchestrator.
-
-    Parameters
-    ----------
-    results_dir : str
-        Path to the hilbert_run results directory.
-    emit : callable
-        Logging/telemetry hook; same shape as in other pipeline steps.
-    """
-    _log("[info] Computing epistemic signatures for elements...", emit)
+def compute_signatures(results_dir: str, emit=DEFAULT_EMIT) -> str:
+    _log(emit, "info", "[signatures] Computing epistemic signatures...")
 
     elements = _load_elements(results_dir, emit)
     if elements.empty:
-        _log("[info] Elements frame empty; aborting info signatures.", emit)
-        return
+        _log(emit, "warn", "[signatures] No elements available")
+        return ""
 
-    labels = _load_labels(results_dir, emit)
+    labels = _load_label_table(results_dir, emit)
     if labels.empty:
-        _log("[info] No labels available; aborting info signatures.", emit)
-        return
+        _log(emit, "warn", "[signatures] No labels available")
+        return ""
 
-    # Join elements to labels at span level
-    df = elements.merge(labels, on="span_id", how="inner")
+    # Determine label mode
+    join_mode = "span" if "span_id" in labels.columns else "element"
+
+    if join_mode == "span":
+        if "span_id" not in elements.columns:
+            _log(emit, "warn", "[signatures] span-level labels but no span_id in elements")
+            return ""
+
+        df = elements.merge(labels, on="span_id", how="inner")
+    else:
+        df = elements.merge(labels, on="element", how="inner")
+
     if df.empty:
-        _log("[info] Join of elements and labels is empty; nothing to do.", emit)
-        return
+        _log(emit, "warn", "[signatures] No matching labels after join")
+        return ""
 
-    # Normalise label column
-    df["label"] = df["label"].apply(_canon_label)
-
-    # Count by (element, label)
+    # Count per (element, label)
     counts = (
         df.groupby(["element", "label"])
         .size()
         .reset_index(name="count")
     )
 
-    # Pivot to columns per label
     pivot = counts.pivot_table(
         index="element",
         columns="label",
@@ -253,65 +233,57 @@ def compute_signatures(results_dir: str, emit=DEFAULT_EMIT) -> None:
         fill_value=0,
     )
 
-    # Ensure all label columns exist
-    for lab in _LABEL_ORDER:
+    for lab in _LABEL_SPACE:
         if lab not in pivot.columns:
             pivot[lab] = 0
 
-    pivot = pivot[_LABEL_ORDER].copy()
-    pivot.reset_index(inplace=True)
+    pivot = pivot[_LABEL_SPACE].reset_index()
 
-    # Compute support, probabilities (Laplace), entropy, dominant label
-    out_rows = []
+    # Build signature rows
+    rows: List[Dict[str, Any]] = []
     for _, row in pivot.iterrows():
-        element = str(row["element"])
-        n_info = int(row["information"])
-        n_mis = int(row["misinformation"])
-        n_dis = int(row["disinformation"])
-        n_amb = int(row["ambiguous"])
+        e = str(row["element"])
+        vec = np.array([row["information"], row["misinformation"], row["disinformation"], row["ambiguous"]], dtype=float)
 
-        counts_vec = np.array([n_info, n_mis, n_dis, n_amb], dtype=float)
-        support = int(counts_vec.sum())
-
-        # Laplace smoothing: +1 to each class
-        smoothed = counts_vec + 1.0
+        support = int(vec.sum())
+        smoothed = vec + 1
         probs = smoothed / smoothed.sum()
+        ent = _shannon_entropy(probs)
+        dom_idx = int(np.argmax(probs))
+        dom = _LABEL_SPACE[dom_idx]
 
-        entropy_bits = _shannon_entropy(probs)
-        dominant_idx = int(np.argmax(probs))
-        dominant_label = _LABEL_ORDER[dominant_idx]
-
-        out_rows.append(
+        rows.append(
             {
-                "element": element,
-                "n_information": n_info,
-                "n_misinformation": n_mis,
-                "n_disinformation": n_dis,
-                "n_ambiguous": n_amb,
+                "element": e,
+                "n_information": int(vec[0]),
+                "n_misinformation": int(vec[1]),
+                "n_disinformation": int(vec[2]),
+                "n_ambiguous": int(vec[3]),
                 "support": support,
                 "p_information": float(probs[0]),
                 "p_misinformation": float(probs[1]),
                 "p_disinformation": float(probs[2]),
                 "p_ambiguous": float(probs[3]),
-                "entropy_bits": entropy_bits,
-                "dominant_label": dominant_label,
+                "entropy_bits": ent,
+                "dominant_label": dom,
             }
         )
 
-    out_df = pd.DataFrame(out_rows).sort_values(
-        ["support", "entropy_bits"], ascending=[False, True]
+    out_df = pd.DataFrame(rows).sort_values(
+        ["support", "entropy_bits"],
+        ascending=[False, True],
     )
 
+    # Write CSV
     csv_path = os.path.join(results_dir, "signatures.csv")
-    json_path = os.path.join(results_dir, "signatures.json")
-
     out_df.to_csv(csv_path, index=False)
 
-    # JSON is a simple list of records keyed by element
-    records: Dict[str, Any] = {}
-    for rec in out_rows:
-        el = rec["element"]
-        records[el] = {
+    # JSON export
+    json_path = os.path.join(results_dir, "signatures.json")
+    out = {}
+    for rec in rows:
+        e = rec["element"]
+        out[e] = {
             "support": rec["support"],
             "p": {
                 "information": rec["p_information"],
@@ -327,19 +299,44 @@ def compute_signatures(results_dir: str, emit=DEFAULT_EMIT) -> None:
         json.dump(
             {
                 "results_dir": results_dir,
-                "label_space": _LABEL_ORDER,
-                "elements": records,
+                "label_space": _LABEL_SPACE,
+                "elements": out,
             },
             f,
             indent=2,
-            ensure_ascii=False,
         )
 
-    _log(
-        f"[info] signatures.csv written with {len(out_df)} elements.",
-        emit,
-    )
-    _log(
-        f"[misinfo] signatures.json written (seed layer for misinfo crystals).",
-        emit,
-    )
+    # ----------------------------------------------------------------------
+    # Graph-contract signature table
+    # ----------------------------------------------------------------------
+    g_path = os.path.join(results_dir, "graph_signatures_nodes.csv")
+
+    gdf = out_df[[
+        "element",
+        "support",
+        "entropy_bits",
+        "p_information",
+        "p_misinformation",
+        "p_disinformation",
+        "p_ambiguous",
+        "dominant_label",
+    ]].copy()
+
+    # Add element_id if available
+    if "element_id" in elements.columns:
+        gdf = gdf.merge(
+            elements[["element", "element_id"]],
+            on="element",
+            how="left",
+        )
+    else:
+        gdf["element_id"] = np.arange(len(gdf))
+
+    gdf.to_csv(g_path, index=False)
+
+    _log(emit, "info", "[signatures] signatures.csv and graph_signatures_nodes.csv written", n_elements=len(out_df))
+
+    return csv_path
+
+
+__all__ = ["compute_signatures"]

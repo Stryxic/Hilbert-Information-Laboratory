@@ -207,3 +207,7 @@ __all__ += ["compute_corpus_perplexity"]
 from .corpus_probe import probe_corpus, run_lsa_seed_profile
 
 __all__ += ["probe_corpus", "run_lsa_seed_profile"]
+
+from .element_roots import run_element_roots
+
+__all__ += ["run_element_roots"]

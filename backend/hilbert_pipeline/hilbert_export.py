@@ -13,7 +13,7 @@ This version is structured as a pedagogical ladder:
   Part II  - Intuitive overview of the pipeline stages
   Part III - Core quantitative metrics (entropy, coherence, regimes, graph)
   Part IV  - Compound and stability analysis
-  Part V   - Dialectic structure and pipeline artifacts
+  Part V   - Dialectic structure, artifacts, reproducibility
   Part VI  - Visual appendix (graphs, persistence fields, etc.)
 
 The ZIP bundle includes core CSV/JSON/PNG/PDF artifacts for archiving.
@@ -36,7 +36,12 @@ import numpy as np
 # -------------------------------------------------------------------------#
 # Orchestrator compatibility emit
 # -------------------------------------------------------------------------#
-DEFAULT_EMIT = lambda *_a, **_k: None  # type: ignore
+try:
+    # Reuse pipeline default emitter if available
+    from . import DEFAULT_EMIT  # type: ignore
+except Exception:  # pragma: no cover - fallback for standalone usage
+    DEFAULT_EMIT = lambda *_a, **_k: None  # type: ignore
+
 
 # -------------------------------------------------------------------------#
 # Compatibility patch: Fix ReportLab md5 issue on some Python builds
@@ -73,7 +78,7 @@ try:
     from reportlab.lib.utils import ImageReader
 
     _HAS_REPORTLAB = True
-except ImportError:
+except ImportError:  # pragma: no cover
     _HAS_REPORTLAB = False
     print("[export][warn] reportlab not installed - PDF will be plain text.")
 
@@ -787,7 +792,7 @@ def _render_all_figures(c: "canvas.Canvas", width: float, height: float, out_dir
 # -------------------------------------------------------------------------#
 # Public API - PDF
 # -------------------------------------------------------------------------#
-def export_summary_pdf(out_dir: str):
+def export_summary_pdf(out_dir: str, emit=DEFAULT_EMIT):
     """
     Build a multi-part, pedagogically structured PDF summary of the run.
     Falls back to a text summary if ReportLab is unavailable.
@@ -810,6 +815,12 @@ def export_summary_pdf(out_dir: str):
     stage_rows = _extract_stage_rows(run_summary)
     dialectic_edges = _extract_dialectic_edges(run_summary)
     artifact_rows = _extract_artifact_rows(run_summary)
+
+    # Environment and versions for reproducibility
+    env_info_raw = run_summary.get("env") or run_summary.get("environment") or {}
+    env_info = env_info_raw if isinstance(env_info_raw, dict) else {}
+    versions_info_raw = run_summary.get("versions") or {}
+    versions_info = versions_info_raw if isinstance(versions_info_raw, dict) else {}
 
     title = "Hilbert Information Chemistry Lab - Run Summary"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -887,7 +898,22 @@ def export_summary_pdf(out_dir: str):
                         f"  - {a['name']} (kind={a['kind']}): {a['path']}\n"
                     )
 
+            if env_info or versions_info:
+                f.write("\nReproducibility:\n")
+                if env_info:
+                    f.write("  Environment:\n")
+                    for k, v in sorted(env_info.items()):
+                        f.write(f"    - {k}: {v}\n")
+                if versions_info:
+                    f.write("  Versions:\n")
+                    for k, v in sorted(versions_info.items()):
+                        f.write(f"    - {k}: {v}\n")
+
         print("[export][warn] reportlab not available - wrote text summary.")
+        try:
+            emit("artifact", {"path": txt_path, "kind": "hilbert_summary_txt"})
+        except Exception:
+            pass
         return
 
     # ------------------------------------------------------------------#
@@ -976,7 +1002,6 @@ def export_summary_pdf(out_dir: str):
     c.drawString(72, y, "The pipeline is a sequence of stages. Each stage transforms the data in a specific way.")
     y -= 12
 
-    # Explain major stages in simple language
     overview_lines = [
         "  1. LSA spectral field:",
         "     The system builds a semantic map of the corpus, where similar spans sit",
@@ -999,8 +1024,8 @@ def export_summary_pdf(out_dir: str):
         "     informational, misinformational, or disinformational.",
         "",
         "  6. Language model scoring:",
-        "     A language model (here, via Ollama) is used to measure how surprising the",
-        "     corpus looks in aggregate (perplexity).",
+        "     A language model is used to measure how surprising the corpus looks in",
+        "     aggregate (perplexity).",
         "",
         "  7. Visual outputs and export:",
         "     Graph snapshots, persistence fields, and summary tables are collected into",
@@ -1183,7 +1208,7 @@ def export_summary_pdf(out_dir: str):
             lm_ppl = lm_metrics.get("perplexity")
             lm_tokens = lm_metrics.get("n_tokens")
 
-            c.drawString(84, y, f"Language model used (Ollama): {lm_model}")
+            c.drawString(84, y, f"Language model used: {lm_model}")
             y -= 12
             if lm_ppl is not None:
                 c.drawString(
@@ -1484,14 +1509,14 @@ def export_summary_pdf(out_dir: str):
                 y -= 14
 
     # ===========================
-    # Part V - Pipeline structure and artifacts
+    # Part V - Pipeline structure, artifacts, reproducibility
     # ===========================
     if y < 200:
         c.showPage()
         y = height - 72
 
     c.setFont("Helvetica-Bold", 13)
-    c.drawString(72, y, "Part V - Pipeline stages, dialectic structure, and artifacts")
+    c.drawString(72, y, "Part V - Pipeline stages, dialectic structure, artifacts, reproducibility")
     y -= 20
 
     # Stages and timeline
@@ -1607,6 +1632,42 @@ def export_summary_pdf(out_dir: str):
                 y = height - 72
                 c.setFont("Helvetica", 8)
 
+    # Reproducibility section
+    if env_info or versions_info:
+        if y < 160:
+            c.showPage()
+            y = height - 72
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(72, y, "Reproducibility notes")
+        y -= 16
+        c.setFont("Helvetica", 9)
+
+        if env_info:
+            c.drawString(84, y, "Environment:")
+            y -= 12
+            for k, v in sorted(env_info.items()):
+                c.drawString(96, y, f"{k}: {v}")
+                y -= 10
+                if y < 72:
+                    c.showPage()
+                    y = height - 72
+                    c.setFont("Helvetica", 9)
+
+        if versions_info:
+            if y < 96:
+                c.showPage()
+                y = height - 72
+                c.setFont("Helvetica", 9)
+            c.drawString(84, y, "Code and dependency versions:")
+            y -= 12
+            for k, v in sorted(versions_info.items()):
+                c.drawString(96, y, f"{k}: {v}")
+                y -= 10
+                if y < 72:
+                    c.showPage()
+                    y = height - 72
+                    c.setFont("Helvetica", 9)
+
     # Footer on last text page
     c.setFont("Helvetica-Oblique", 8)
     c.setFillColor(colors.darkgray)
@@ -1624,12 +1685,16 @@ def export_summary_pdf(out_dir: str):
 
     c.save()
     print(f"[export] PDF summary written to {pdf_path}")
+    try:
+        emit("artifact", {"path": pdf_path, "kind": "hilbert_summary_pdf"})
+    except Exception:
+        pass
 
 
 # -------------------------------------------------------------------------#
 # Public API - ZIP
 # -------------------------------------------------------------------------#
-def export_zip(out_dir: str):
+def export_zip(out_dir: str, emit=DEFAULT_EMIT):
     """
     Create a compact ZIP of core outputs for this run.
     """
@@ -1652,10 +1717,15 @@ def export_zip(out_dir: str):
         "element_clusters.json",
         "element_cluster_metrics.json",
         "signal_stability.csv",
+        "stability_meta.json",
         "compound_contexts.json",
         "hilbert_summary.pdf",
         "hilbert_summary.txt",
         "hilbert_run.json",
+        "span_element_fusion.csv",
+        "molecules.csv",
+        "signatures.csv",
+        "signatures.json",
     }
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1674,6 +1744,10 @@ def export_zip(out_dir: str):
                     zf.write(fpath, arcname=arcname)
 
     print(f"[export] Created archive: {zip_path}")
+    try:
+        emit("artifact", {"path": zip_path, "kind": "hilbert_export_zip"})
+    except Exception:
+        pass
 
 
 # -------------------------------------------------------------------------#
@@ -1688,14 +1762,17 @@ def run_full_export(out_dir: str, emit=DEFAULT_EMIT) -> None:
     - Emits lightweight stage events for the API.
     """
     try:
-        emit("log", {"stage": "export", "event": "start"})
+        emit("pipeline", {"stage": "export", "event": "start"})
     except Exception:
         pass
 
-    export_summary_pdf(out_dir)
-    export_zip(out_dir)
+    export_summary_pdf(out_dir, emit=emit)
+    export_zip(out_dir, emit=emit)
 
     try:
-        emit("log", {"stage": "export", "event": "end"})
+        emit("pipeline", {"stage": "export", "event": "end"})
     except Exception:
         pass
+
+
+__all__ = ["export_summary_pdf", "export_zip", "run_full_export"]

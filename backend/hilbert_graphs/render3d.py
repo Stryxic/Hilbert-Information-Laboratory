@@ -1,278 +1,144 @@
-"""
-3D rendering of Hilbert graphs (electron-cloud v6 - alpha-safe, holographic shell).
+# render3d.py
 
-Features
---------
-- Electron-cloud tiny-point 3D rendering
-- Volume stabilisation:
-    * detect collapsed / cigar-shaped layouts
-    * inject small jitter and whiten axes to use full 3D volume
-- Optional LSA integration:
-    * if per-node LSA coordinates exist, blend them into the layout
-- Importance-centred radial warp:
-    * high-importance nodes pulled toward the weighted centroid
-    * low-importance nodes gently pushed outward to the periphery
-- Depth-sorted nodes
-- Depth fog
-- Depth-sorted faint edges (filaments)
-- Volumetric halos
-- Stable camera framing
-- Safe alpha bounds (never > 1.0)
+"""
+3D holographic snapshot renderer for the Hilbert graph visualiser.
+
+Responsibilities:
+    - take a prepared NetworkX graph + 3D positions
+    - use NodeStyleMaps / EdgeStyleMaps and VisualStyle
+    - render a depth-aware "holographic shell" PNG
+
+Layout geometry is assumed to be handled upstream by layout3d; here we:
+    - apply mild importance-based radial warping
+    - use depth to attenuate colours and edge opacity (depth fog)
+    - use degree-based "ambient occlusion" to darken dense cores
+    - standardise camera and framing
 """
 
 from __future__ import annotations
-from typing import Dict, Tuple, List
 
-import matplotlib
-
-matplotlib.use("Agg")
+from typing import Dict, Tuple, Iterable
 
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - needed for 3D projection
+import matplotlib.patheffects as patheffects
 import networkx as nx
 import numpy as np
 
-from .styling import NodeStyleMaps, EdgeStyleMaps
 from .presets import VisualStyle
+from .styling import NodeStyleMaps, EdgeStyleMaps
 
 
 # --------------------------------------------------------------------------- #
-# Camera utilities
+# Utilities
 # --------------------------------------------------------------------------- #
 
 
-def _camera_frame_3d(
+def _frame_from_positions_3d(
     pos: Dict[str, Tuple[float, float, float]],
-    margin_pct: float = 0.08,
+    margin: float = 0.08,
 ) -> Tuple[float, float, float, float, float, float]:
-    """Percentile-based 3D bounding cube with margin padding."""
-    if not pos:
-        return -1.0, 1.0, -1.0, 1.0, -1.0, 1.0
-
+    """
+    Compute a padded 3D bounding box from node coordinates.
+    """
     xs = np.array([p[0] for p in pos.values()], float)
     ys = np.array([p[1] for p in pos.values()], float)
     zs = np.array([p[2] for p in pos.values()], float)
 
-    def rng(a: np.ndarray) -> Tuple[float, float]:
-        # Slightly tighter percentiles for static figures to avoid huge voids
-        lo, hi = np.percentile(a, [5, 95])
-        span = max(hi - lo, 1e-9)
-        pad = span * margin_pct
-        return float(lo - pad), float(hi + pad)
+    x_min, x_max = float(xs.min()), float(xs.max())
+    y_min, y_max = float(ys.min()), float(ys.max())
+    z_min, z_max = float(zs.min()), float(zs.max())
 
-    x_min, x_max = rng(xs)
-    y_min, y_max = rng(ys)
-    z_min, z_max = rng(zs)
-    return x_min, x_max, y_min, y_max, z_min, z_max
+    dx = max(x_max - x_min, 1e-9)
+    dy = max(y_max - y_min, 1e-9)
+    dz = max(z_max - z_min, 1e-9)
+    span = max(dx, dy, dz)
+
+    cx = 0.5 * (x_min + x_max)
+    cy = 0.5 * (y_min + y_max)
+    cz = 0.5 * (z_min + z_max)
+
+    pad = span * margin
+
+    return (
+        cx - span / 2.0 - pad,
+        cx + span / 2.0 + pad,
+        cy - span / 2.0 - pad,
+        cy + span / 2.0 + pad,
+        cz - span / 2.0 - pad,
+        cz + span / 2.0 + pad,
+    )
 
 
-def _view_vector(elev: float, azim: float) -> np.ndarray:
-    """Compute camera view vector from elev/azim (degrees)."""
-    er, ar = np.deg2rad(elev), np.deg2rad(azim)
-    return np.array(
+def _depth_sorted_edges_3d(
+    G: nx.Graph,
+    pos: Dict[str, Tuple[float, float, float]],
+    azim: float,
+    elev: float,
+) -> Iterable[Tuple[str, str, float]]:
+    """
+    Sort edges back-to-front along the current camera direction.
+
+    We approximate depth as the projection of the midpoint onto the
+    camera vector derived from (elev, azim).
+    """
+    # Camera direction in data space (unit vector)
+    ea = np.deg2rad(elev)
+    aa = np.deg2rad(azim)
+    cam_dir = np.array(
         [
-            np.cos(er) * np.sin(ar),
-            np.sin(er),
-            np.cos(er) * np.cos(ar),
+            np.cos(ea) * np.cos(aa),
+            np.cos(ea) * np.sin(aa),
+            np.sin(ea),
         ],
         float,
     )
 
-
-def _depth_sort_points(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    zs: np.ndarray,
-    elev: float,
-    azim: float,
-) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    """Sort nodes by depth; return order, normalised depths, and raw min/max."""
-    view = _view_vector(elev, azim)
-    pts = np.stack([xs, ys, zs], axis=1)
-    depths = pts @ view
-
-    dmin = float(depths.min())
-    dmax = float(depths.max())
-    span = max(dmax - dmin, 1e-9)
-    depths_norm = (depths - dmin) / span
-
-    order = np.argsort(depths)  # furthest first
-    return order, depths_norm, dmin, dmax
-
-
-def _sort_edges_by_depth(
-    G: nx.Graph,
-    pos: Dict[str, Tuple[float, float, float]],
-    elev: float,
-    azim: float,
-) -> Tuple[List[Tuple[str, str]], List[float]]:
-    """Return edges sorted by depth (furthest first) plus their depths."""
-    view = _view_vector(elev, azim)
-    data: List[Tuple[Tuple[str, str], float]] = []
-
+    edges = []
     for u, v in G.edges():
         if u not in pos or v not in pos:
             continue
-        mid = (np.array(pos[u], float) + np.array(pos[v], float)) / 2.0
-        data.append(((u, v), float(mid @ view)))
+        x0, y0, z0 = pos[u]
+        x1, y1, z1 = pos[v]
+        mid = np.array([(x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5], float)
+        depth = float(np.dot(mid, cam_dir))
+        edges.append((depth, u, v))
 
-    data.sort(key=lambda x: x[1])
-    edges = [e for e, _ in data]
-    depths = [d for _, d in data]
-    return edges, depths
-
-
-# --------------------------------------------------------------------------- #
-# Volume stabilisation / holographic shell support
-# --------------------------------------------------------------------------- #
+    edges.sort(key=lambda t: t[0], reverse=True)  # furthest first
+    for depth, u, v in edges:
+        yield u, v, depth
 
 
-def _maybe_blend_lsa_offsets(
-    G: nx.Graph,
-    nodes: List[str],
-    base_coords: np.ndarray,
-    strength: float = 0.25,
-) -> np.ndarray:
-    """
-    Optionally blend LSA coordinates into the layout.
-
-    If nodes carry attributes like `lsa_x/lsa_y/lsa_z` or `lsa0/lsa1/lsa2`,
-    we use them as an additional semantic offset. If not present, this is a
-    no-op.
-    """
-    lsa_vecs: List[np.ndarray] = []
-
-    for n in nodes:
-        d = G.nodes[n]
-        if "lsa_x" in d and "lsa_y" in d and "lsa_z" in d:
-            lsa_vecs.append(
-                np.array(
-                    [float(d["lsa_x"]), float(d["lsa_y"]), float(d["lsa_z"])],
-                    float,
-                )
+def _rgba_tuple(c):
+    """Normalise a color mapping entry into an (r,g,b,a) tuple."""
+    if c is None:
+        return 0.7, 0.8, 0.9, 1.0
+    if isinstance(c, (list, tuple)):
+        if len(c) == 3:
+            return float(c[0]), float(c[1]), float(c[2]), 1.0
+        if len(c) >= 4:
+            return (
+                float(c[0]),
+                float(c[1]),
+                float(c[2]),
+                float(c[3]),
             )
-        elif "lsa0" in d and "lsa1" in d and "lsa2" in d:
-            lsa_vecs.append(
-                np.array(
-                    [float(d["lsa0"]), float(d["lsa1"]), float(d["lsa2"])],
-                    float,
-                )
-            )
-        else:
-            # No LSA coordinates for this node.
-            lsa_vecs.append(np.zeros(3, float))
-
-    L = np.stack(lsa_vecs, axis=0)
-    if not np.any(L):
-        return base_coords
-
-    # Centre and normalise LSA vectors
-    L -= L.mean(axis=0, keepdims=True)
-    span = L.ptp(axis=0)
-    span[span < 1e-9] = 1.0
-    L /= span
-
-    return base_coords + strength * L
+    return 0.7, 0.8, 0.9, 1.0
 
 
-def _stabilise_volume(
-    coords: np.ndarray,
-    jitter_scale: float = 0.05,
-    seed: int = 42,
-) -> np.ndarray:
-    """
-    Ensure the 3D cloud uses the volumetric space.
-
-    - Recentre to origin
-    - Detect collapsed / narrow axes; add small jitter if necessary
-    - Whiten axes so spans are comparable
-    - Normalise radius so most points lie within unit sphere
-    """
-    if coords.size == 0:
-        return coords
-
-    rng = np.random.default_rng(seed)
-
-    X = coords.copy().astype(float)
-    centre = X.mean(axis=0)
-    X -= centre
-
-    spans = X.max(axis=0) - X.min(axis=0)
-    max_span = float(spans.max())
-    min_span = float(spans.min())
-
-    if max_span < 1e-9:
-        # Degenerate case: everything at a point
-        X += rng.normal(scale=1.0, size=X.shape)
-        spans = X.max(axis=0) - X.min(axis=0)
-        max_span = float(spans.max())
-        min_span = float(spans.min())
-
-    # If highly anisotropic (needle or flat sheet), inject jitter
-    if min_span < 0.12 * max_span:
-        jitter = rng.normal(scale=jitter_scale * max_span, size=X.shape)
-        X += jitter
-        spans = X.max(axis=0) - X.min(axis=0)
-        spans[spans < 1e-9] = max_span
-
-    # Whiten axes so they occupy similar ranges
-    spans = X.max(axis=0) - X.min(axis=0)
-    spans[spans < 1e-9] = spans[spans >= 1e-9].max()
-    X /= spans
-
-    # Normalise radius to lie roughly in unit ball
-    radii = np.linalg.norm(X, axis=1)
-    r_max = float(np.max(radii))
-    if r_max > 1e-9:
-        X /= r_max
-
-    return X
+def _norm01(a: np.ndarray) -> np.ndarray:
+    """Safe normalisation to [0,1]."""
+    if a.size == 0:
+        return a
+    lo = float(a.min())
+    hi = float(a.max())
+    if hi - lo < 1e-9:
+        return np.zeros_like(a)
+    return (a - lo) / (hi - lo)
 
 
 # --------------------------------------------------------------------------- #
-# Labels
-# --------------------------------------------------------------------------- #
-
-
-def _draw_labels_3d(
-    ax,
-    G: nx.Graph,
-    pos: Dict[str, Tuple[float, float, float]],
-    node_styles: NodeStyleMaps,
-    style: VisualStyle,
-    label_budget: int,
-) -> None:
-    """Draw a small set of primary labels in 3D."""
-    if label_budget <= 0:
-        return
-
-    primary = list(getattr(node_styles, "primary_labels", []))
-    if not primary:
-        sizes = getattr(node_styles, "sizes", {}) or {}
-        if not sizes:
-            return
-        ordered = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)
-        primary = [n for n, _ in ordered]
-
-    primary = [n for n in primary if n in G.nodes() and n in pos][:label_budget]
-
-    for n in primary:
-        x, y, z = pos[n]
-        ax.text(
-            x,
-            y,
-            z,
-            str(n),
-            fontsize=style.label_primary_size,
-            color=style.label_color,
-            ha="center",
-            va="center",
-            zorder=30,
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Main renderer
+# Main 3D renderer
 # --------------------------------------------------------------------------- #
 
 
@@ -282,179 +148,61 @@ def draw_3d_snapshot(
     node_styles: NodeStyleMaps,
     edge_styles: EdgeStyleMaps,
     style: VisualStyle,
+    *,
     outfile: str,
-    title: str,
-    subtitle: str,
-    label_budget: int,
+    title: str = "",
+    subtitle: str = "",
+    label_budget: int = 12,
 ) -> None:
     """
-    Render a single 3D PNG snapshot as a holographic, importance-centred
-    electron cloud.
+    Render a 3D holographic snapshot of the Hilbert information graph.
 
-    - High-importance nodes (by node_styles.sizes) pulled toward centroid
-    - Low-importance nodes pushed outward
-    - Layout volume stabilised and optionally LSA-enhanced
-    - Tiny points with halos and depth fog
-    - Faint, depth-sorted edges
+    Parameters mirror draw_2d_snapshot, but with 3D positions.
     """
     if G.number_of_nodes() == 0:
         return
 
-    nodes = list(G.nodes())
+    nodes = [n for n in G.nodes() if n in pos3d]
     if not nodes:
         return
 
-    # Filter positions to subgraph
-    pos = {n: pos3d[n] for n in nodes if n in pos3d}
-    if not pos:
-        return
+    pos = {n: pos3d[n] for n in nodes}
 
-    # ------------------------------------------------------------------ #
-    # Base coordinates as array
-    # ------------------------------------------------------------------ #
+    # Base coordinates as array, for simple radial warping
     P = np.array([[pos[n][0], pos[n][1], pos[n][2]] for n in nodes], float)
 
-    # Optional: blend in LSA offsets if present
-    P = _maybe_blend_lsa_offsets(G, nodes, P, strength=0.25)
-
-    # Stabilise volume (prevent 1D collapse)
-    P = _stabilise_volume(P, jitter_scale=0.06, seed=42)
-
-    # ------------------------------------------------------------------ #
-    # Importance & simple density (for alpha boost)
-    # ------------------------------------------------------------------ #
+    # Importance from style.sizes → used for inner/outer shell
     size_map = node_styles.sizes or {}
     size_arr = np.array([float(size_map.get(n, 40.0)) for n in nodes], float)
-
-    s_min = float(size_arr.min())
-    s_max = float(size_arr.max())
+    s_min, s_max = float(size_arr.min()), float(size_arr.max())
     s_span = max(s_max - s_min, 1e-9)
     importance = (size_arr - s_min) / s_span  # 0..1
 
-    # Degree as a proxy for local density
-    deg_arr = np.array([float(G.degree(n)) for n in nodes], float)
-    if deg_arr.size > 0:
-        d_min, d_max = float(deg_arr.min()), float(deg_arr.max())
-        d_span = max(d_max - d_min, 1e-9)
-        density = (deg_arr - d_min) / d_span
-    else:
-        density = np.zeros_like(importance)
-
-    # ------------------------------------------------------------------ #
-    # Importance-based radial warp (semantically centred shell)
-    # ------------------------------------------------------------------ #
-    weights = importance + 1e-3
-    weights = weights / weights.sum()
-    centroid = (P * weights[:, None]).sum(axis=0)
-
+    # Mild radial warp: important nodes slightly drawn inward
+    centroid = P.mean(axis=0)
     P_shift = P - centroid
     radii = np.linalg.norm(P_shift, axis=1)
     directions = np.zeros_like(P_shift)
     mask = radii > 1e-9
     directions[mask] = P_shift[mask] / radii[mask, None]
 
-    # Shell scaling:
-    #   importance=1   → radius compressed (inner shell)
-    #   importance=0   → radius expanded (outer shell)
-    inner_scale = 0.75
-    outer_scale = 1.6
+    inner_scale = 0.8
+    outer_scale = 1.4
     scale = outer_scale - (outer_scale - inner_scale) * importance
-    scale = np.clip(scale, 0.6, 2.0)
-
+    scale = np.clip(scale, 0.7, 1.7)
     radii_new = radii * scale
     P_new = centroid + directions * radii_new[:, None]
 
     # Write back warped positions
     for i, n in enumerate(nodes):
-        pos[n] = (float(P_new[i, 0]), float(P_new[i, 1]), float(P_new[i, 2]))
+        x, y, z = P_new[i]
+        pos[n] = (float(x), float(y), float(z))
 
-    # Camera bounds use warped positions
-    x_min, x_max, y_min, y_max, z_min, z_max = _camera_frame_3d(pos)
-
-    # ------------------------------------------------------------------ #
-    # Style maps and edge alpha
-    # ------------------------------------------------------------------ #
-    color_map = node_styles.colors
-    widths_map = edge_styles.widths
-
-    if edge_styles.alpha is not None:
-        edge_alpha = float(edge_styles.alpha)
-    else:
-        edge_alpha = (
-            style.edge_alpha_dense if len(nodes) > 600 else style.edge_alpha_sparse
-        )
-    edge_alpha = float(np.clip(edge_alpha, 0.0, 1.0))
+    # Camera framing from warped positions
+    x_min, x_max, y_min, y_max, z_min, z_max = _frame_from_positions_3d(pos)
 
     # ------------------------------------------------------------------ #
-    # Node sizes (electron-cloud, but more generous for visibility)
-    # ------------------------------------------------------------------ #
-    raw = size_arr.copy()
-    rmin, rmax = float(raw.min()), float(raw.max())
-    span = max(rmax - rmin, 1e-9)
-    norm = (raw - rmin) / span
-
-    size_min, size_max = 4.0, 22.0
-    sizes = size_min + (size_max - size_min) * (norm ** 0.9)
-    halos = sizes * 1.9
-
-    # ------------------------------------------------------------------ #
-    # Node colours
-    # ------------------------------------------------------------------ #
-    def NC(c):
-        if c is None:
-            return (0.5, 0.6, 0.9, 1.0)
-        if len(c) == 3:
-            return (float(c[0]), float(c[1]), float(c[2]), 1.0)
-        return (float(c[0]), float(c[1]), float(c[2]), float(c[3]))
-
-    cols = np.array([NC(color_map.get(n)) for n in nodes], float)
-
-    # Coordinates from warped positions
-    xs = np.array([pos[n][0] for n in nodes], float)
-    ys = np.array([pos[n][1] for n in nodes], float)
-    zs = np.array([pos[n][2] for n in nodes], float)
-
-    # ------------------------------------------------------------------ #
-    # Depth sort nodes + global depth range
-    # ------------------------------------------------------------------ #
-    elev = float(getattr(style, "camera_elev", 25.0))
-    azim = float(getattr(style, "camera_azim", 35.0))
-
-    order, dnorm, dmin, dmax = _depth_sort_points(xs, ys, zs, elev, azim)
-
-    xs, ys, zs = xs[order], ys[order], zs[order]
-    sizes, halos = sizes[order], halos[order]
-    cols = cols[order]
-    dnorm = dnorm[order]
-    density = density[order]
-
-    # ------------------------------------------------------------------ #
-    # Depth fog plus simple density-based alpha boost
-    # ------------------------------------------------------------------ #
-    fog_near, fog_far = 1.0, 0.22
-    fog = fog_far + (fog_near - fog_far) * dnorm
-    fog = np.clip(fog, 0.0, 1.0)
-
-    # Dense regions glow a bit more
-    dens_boost = 0.6 + 0.7 * density  # in [0.6, 1.3]
-    dens_boost = np.clip(dens_boost, 0.4, 1.4)
-
-    halo_colors = cols.copy()
-    core_colors = cols.copy()
-
-    halo_colors[:, 3] = np.clip(
-        halo_colors[:, 3] * fog * dens_boost * style.node_halo_alpha,
-        0.0,
-        1.0,
-    )
-    core_colors[:, 3] = np.clip(
-        core_colors[:, 3] * fog * dens_boost * style.node_alpha,
-        0.0,
-        1.0,
-    )
-
-    # ------------------------------------------------------------------ #
-    # Figure
+    # Figure + axes
     # ------------------------------------------------------------------ #
     fig = plt.figure(figsize=(18, 14), facecolor=style.background_color)
     ax = fig.add_subplot(111, projection="3d")
@@ -469,87 +217,223 @@ def draw_3d_snapshot(
     ax.set_ylim(y_min, y_max)
     ax.set_zlim(z_min, z_max)
 
+    # keep box roughly cubic
     try:
         ax.set_box_aspect((x_max - x_min, y_max - y_min, z_max - z_min))
     except Exception:
         pass
 
+    elev = getattr(style, "camera_elev", 22.0)
+    azim = getattr(style, "camera_azim", 38.0)
     try:
         ax.set_proj_type(getattr(style, "camera_projection", "persp"))
     except Exception:
         pass
-
     ax.view_init(elev=elev, azim=azim)
 
     # ------------------------------------------------------------------ #
-    # Depth-sorted edges (α-safe)
+    # Depth helpers
     # ------------------------------------------------------------------ #
-    sorted_edges, edge_depths = _sort_edges_by_depth(G, pos, elev, azim)
+    # Recompute projected depth for each node
+    ea = np.deg2rad(elev)
+    aa = np.deg2rad(azim)
+    cam_dir = np.array(
+        [
+            np.cos(ea) * np.cos(aa),
+            np.cos(ea) * np.sin(aa),
+            np.sin(ea),
+        ],
+        float,
+    )
 
-    edge_depths = np.array(edge_depths, float)
-    if edge_depths.size > 0:
-        e_min = float(edge_depths.min())
-        e_max = float(edge_depths.max())
-    else:
-        e_min, e_max = 0.0, 1.0
-    e_span = max(e_max - e_min, 1e-9)
+    node_depth = {}
+    for n in nodes:
+        x, y, z = pos[n]
+        node_depth[n] = float(np.dot(np.array([x, y, z], float), cam_dir))
 
-    fog_near_e, fog_far_e = 1.0, 0.22  # reuse fog range for edges
+    depths = np.array([node_depth[n] for n in nodes], float)
+    d_min, d_max = float(depths.min()), float(depths.max())
+    d_span = max(d_max - d_min, 1e-9)
+    depth_norm = (depths - d_min) / d_span  # 0 = near, 1 = far
 
-    for (u, v), depth in zip(sorted_edges, edge_depths):
+    # Degree-based "ambient occlusion" factor (high-degree = more occluded)
+    deg_arr = np.array([float(G.degree(n)) for n in nodes], float)
+    deg_norm = _norm01(deg_arr)
+    occlusion = deg_norm  # 0 = isolated, 1 = very dense core
+
+    # ------------------------------------------------------------------ #
+    # Edges with depth-aware alpha and mild occlusion
+    # ------------------------------------------------------------------ #
+    width_map = edge_styles.widths or {}
+    edge_color_map = edge_styles.colors or {}
+    base_alpha = edge_styles.alpha
+    if base_alpha is None:
+        base_alpha = (
+            style.edge_alpha_dense if len(nodes) > 700 else style.edge_alpha_sparse
+        )
+
+    for u, v, depth in _depth_sorted_edges_3d(G, pos, azim=azim, elev=elev):
         if u not in pos or v not in pos:
             continue
 
-        w = widths_map.get((u, v)) or widths_map.get((v, u))
-        if w is None:
-            w = (style.edge_width_min + style.edge_width_max) / 2.0
+        # width
+        key = (u, v)
+        if key not in width_map and (v, u) in width_map:
+            key = (v, u)
+        width = float(
+            width_map.get(
+                key,
+                (style.edge_width_min + style.edge_width_max) * 0.5,
+            )
+        )
 
-        depth_n = (depth - e_min) / e_span
-        depth_n = float(np.clip(depth_n, 0.0, 1.0))
+        # color
+        c_key = (u, v)
+        if c_key not in edge_color_map and (v, u) in edge_color_map:
+            c_key = (v, u)
+        r, g, b, a0 = _rgba_tuple(edge_color_map.get(c_key, style.edge_color))
 
-        efog = fog_far_e + (fog_near_e - fog_far_e) * depth_n
-        efog = float(np.clip(efog, 0.0, 1.0))
+        # depth fog: farther edges are fainter
+        depth_norm_edge = (depth - d_min) / d_span
+        depth_fog = 0.35 + 0.65 * (1.0 - depth_norm_edge)
 
+        # occlusion based on endpoints' degree
+        oc_u = occlusion[nodes.index(u)] if u in nodes else 0.0
+        oc_v = occlusion[nodes.index(v)] if v in nodes else 0.0
+        oc_edge = 0.5 * (oc_u + oc_v)
+        ao_factor = 0.4 + 0.6 * (1.0 - oc_edge)  # high-degree edges darker
+
+        alpha = float(np.clip(a0 * base_alpha * depth_fog * ao_factor, 0.0, 1.0))
+
+        x0, y0, z0 = pos[u]
+        x1, y1, z1 = pos[v]
         ax.plot(
-            [pos[u][0], pos[v][0]],
-            [pos[u][1], pos[v][1]],
-            [pos[u][2], pos[v][2]],
-            linewidth=float(w),
-            color=style.edge_color,
-            alpha=float(np.clip(edge_alpha * efog, 0.0, 1.0)),
-            zorder=2,
+            [x0, x1],
+            [y0, y1],
+            [z0, z1],
+            linewidth=width,
+            color=(r, g, b, alpha),
+            solid_capstyle="round",
+            zorder=1,
         )
 
     # ------------------------------------------------------------------ #
-    # Halos + core electrons
+    # Nodes: halo + core with depth-aware alpha and occlusion
     # ------------------------------------------------------------------ #
+    halo_map = node_styles.halo_sizes or {}
+    color_map = node_styles.colors or {}
+
+    raw_sizes = size_arr
+    rs_min, rs_max = float(raw_sizes.min()), float(raw_sizes.max())
+    rs_span = max(rs_max - rs_min, 1e-9)
+    size_norm = (raw_sizes - rs_min) / rs_span
+
+    core_sizes = 14.0 + 26.0 * (size_norm ** 0.9)
+    halo_sizes = []
+    for i, n in enumerate(nodes):
+        if halo_map:
+            halo_sizes.append(
+                float(halo_map.get(n, core_sizes[i] * style.node_halo_scale))
+            )
+        else:
+            halo_sizes.append(core_sizes[i] * style.node_halo_scale)
+    halo_sizes = np.asarray(halo_sizes, float)
+
+    cols = np.array([_rgba_tuple(color_map.get(n)) for n in nodes], float)
+
+    # depth-aware fade + ambient occlusion for nodes
+    depth_fog_nodes = 0.3 + 0.7 * (1.0 - depth_norm)
+    ao_nodes = 0.4 + 0.6 * (1.0 - occlusion)  # dense core slightly darkened
+    fog = depth_fog_nodes * ao_nodes
+
+    halo_colors = cols.copy()
+    core_colors = cols.copy()
+    halo_colors[:, 3] = np.clip(
+        halo_colors[:, 3] * fog * style.node_halo_alpha,
+        0.0,
+        1.0,
+    )
+    core_colors[:, 3] = np.clip(
+        core_colors[:, 3] * fog * style.node_alpha,
+        0.0,
+        1.0,
+    )
+
+    xs = np.array([pos[n][0] for n in nodes], float)
+    ys = np.array([pos[n][1] for n in nodes], float)
+    zs = np.array([pos[n][2] for n in nodes], float)
+
+    # Draw halos slightly behind cores
     ax.scatter(
         xs,
         ys,
         zs,
-        s=halos,
+        s=halo_sizes,
         c=halo_colors,
-        edgecolors="none",
+        marker="o",
+        linewidths=0.0,
         depthshade=False,
-        zorder=5,
+        zorder=3,
     )
+
     ax.scatter(
         xs,
         ys,
         zs,
-        s=sizes,
+        s=core_sizes,
         c=core_colors,
+        marker="o",
+        linewidths=0.0,
         edgecolors=style.node_edge_color,
-        linewidths=0.2,
         depthshade=False,
-        zorder=10,
+        zorder=4,
     )
 
     # ------------------------------------------------------------------ #
-    # Labels & metadata
+    # Labels (budget-limited, drawn for nearer / larger nodes)
     # ------------------------------------------------------------------ #
-    _draw_labels_3d(ax, G, pos, node_styles, style, label_budget)
+    label_map = node_styles.primary_labels or {}
 
+    if label_budget > 0 and label_map:
+        # combine importance (size) and nearness for label ranking
+        rank_score = {}
+        for i, n in enumerate(nodes):
+            score = 0.7 * size_norm[i] + 0.3 * (1.0 - depth_norm[i])
+            rank_score[n] = score
+
+        candidates = sorted(
+            [n for n in nodes if n in label_map],
+            key=lambda n: rank_score.get(n, 0.0),
+            reverse=True,
+        )[:label_budget]
+
+        for n in candidates:
+            x, y, z = pos[n]
+            text = str(label_map.get(n, n))
+            txt = ax.text(
+                x,
+                y,
+                z,
+                text,
+                fontsize=style.label_primary_size,
+                color=style.label_color,
+                ha="center",
+                va="center",
+                zorder=6,
+            )
+            txt.set_path_effects(
+                [
+                    patheffects.Stroke(
+                        linewidth=style.label_outline_width,
+                        foreground=style.label_outline_color,
+                    ),
+                    patheffects.Normal(),
+                ]
+            )
+
+    # ------------------------------------------------------------------ #
+    # Titles / subtitles
+    # ------------------------------------------------------------------ #
     if title:
         ax.set_title(
             title,
@@ -562,5 +446,5 @@ def draw_3d_snapshot(
         fig.text(0.01, 0.965, subtitle, color="#bfc5ce", fontsize=9, ha="left")
 
     plt.tight_layout(pad=0.5)
-    plt.savefig(outfile, dpi=style.dpi)
+    plt.savefig(outfile, dpi=style.dpi, facecolor=style.background_color)
     plt.close()

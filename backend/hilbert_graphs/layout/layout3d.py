@@ -1,160 +1,155 @@
 """
-3D layout engines for Hilbert graphs (spherical manifold version).
+3D spherical-manifold layout (stable, semantic, community-aware, scientifically interpretable).
 
-Purpose
--------
-This layout solves the persistent problems of spring_layout collapse by
-placing every node on a semantically meaningful spherical shell using:
+This module replaces the older 3D layout with a stable manifold layout whose
+axes correspond to meaningful semantic structure:
 
-    - LSA vectors (if available)
-    - spectral fallback (if not)
-    - semantic importance radius modulation
-    - jitter + whitening for shape stability
-    - global unit-sphere normalisation
+  - Longitude  ~ semantic direction (LSA / spectral embedding)
+  - Latitude   ~ community structure (information continents)
+  - Radius     ~ epistemic depth (stability / entropy / coherence / tf/degree)
+  - Tangential jitter to prevent collapse
+  - Final normalisation to unit sphere for renderer stability
 
-Output coordinates are ideal for the holographic shell renderer.
+Public API:
+    - compute_layout_3d_spherical
 """
 
 from __future__ import annotations
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import networkx as nx
 
 
 # ============================================================================ #
-# Utilities
+# Internal helpers
 # ============================================================================ #
 
-def _norm_or_zero(v: np.ndarray) -> np.ndarray:
-    """Normalise vectors row-wise; if any vector has near-zero norm, leave it."""
+def _safe_norm(v: np.ndarray) -> np.ndarray:
+    """Row-normalise v with zero-safety."""
     n = np.linalg.norm(v, axis=1, keepdims=True)
     n[n < 1e-12] = 1.0
     return v / n
 
 
-def _extract_lsa_vectors(G: nx.Graph, nodes: List[str]):
+def _extract_lsa_vectors(G: nx.Graph, nodes: List[str]) -> Optional[np.ndarray]:
     """
-    Try to extract LSA vectors for each node, in any of these formats:
-        - lsa_x, lsa_y, lsa_z
-        - lsa0, lsa1, lsa2
-    If missing, return None.
+    Extract LSA vectors in any recognised format:
+      - (lsa_x, lsa_y, lsa_z)
+      - (lsa0, lsa1, lsa2)
+    If none present, return None.
     """
     L = []
-    found_any = False
+    found = False
 
     for n in nodes:
         d = G.nodes[n]
-
         if all(k in d for k in ("lsa_x", "lsa_y", "lsa_z")):
-            found_any = True
+            found = True
             L.append([float(d["lsa_x"]), float(d["lsa_y"]), float(d["lsa_z"])])
-
         elif all(k in d for k in ("lsa0", "lsa1", "lsa2")):
-            found_any = True
+            found = True
             L.append([float(d["lsa0"]), float(d["lsa1"]), float(d["lsa2"])])
-
         else:
             L.append([0.0, 0.0, 0.0])
 
-    if not found_any:
+    if not found:
         return None
 
-    L = np.array(L, dtype=float)
-    L -= L.mean(axis=0, keepdims=True)
-
-    span = L.ptp(axis=0)
+    A = np.array(L, float)
+    A -= A.mean(axis=0, keepdims=True)
+    span = A.ptp(axis=0)
     span[span < 1e-9] = 1.0
-    L /= span
-
-    return L
+    return A / span
 
 
-def _fallback_spectral_embedding(G: nx.Graph, nodes: List[str]):
-    """
-    If LSA unavailable, obtain 3D embedding from spectral_layout.
-    Then normalise & use as direction vectors.
-    """
+def _fallback_spectral_embedding(G: nx.Graph, nodes: List[str]) -> np.ndarray:
+    """Use spectral_layout(dim=3) if no LSA vectors exist."""
     try:
-        pos_dict = nx.spectral_layout(G, dim=3, weight="weight")
+        pos = nx.spectral_layout(G, dim=3, weight="weight")
     except Exception:
         pos2 = nx.spectral_layout(G, dim=2, weight="weight")
         rng = np.random.default_rng(42)
-        pos_dict = {
-            n: np.array([p[0], p[1], rng.normal(scale=0.1)], float)
-            for n, p in pos2.items()
-        }
+        pos = {n: np.array([p[0], p[1], rng.normal(scale=0.2)]) for n, p in pos2.items()}
 
-    V = np.array([pos_dict[n] for n in nodes], dtype=float)
-    V -= V.mean(axis=0, keepdims=True)
-    return V
+    A = np.array([pos[n] for n in nodes], float)
+    A -= A.mean(axis=0, keepdims=True)
+    return A
 
 
-def _compute_importance(G: nx.Graph, nodes: List[str]):
+def _compute_importance(G: nx.Graph, nodes: List[str]) -> np.ndarray:
     """
-    Normalised importance score in [0,1] from:
-        - degree
-        - tf
-        - coherence
+    Multi-metric epistemic importance score in [0,1], combining:
+      - degree
+      - tf
+      - coherence
+      - (optionally) stability
     """
     deg = np.array([float(G.degree(n)) for n in nodes], float)
     tf = np.array([float(G.nodes[n].get("tf", 1.0)) for n in nodes], float)
-    coh = np.array([
-        float(G.nodes[n].get("mean_coherence", G.nodes[n].get("coherence", 0.0)))
-        for n in nodes
-    ], float)
+    coh = np.array([float(G.nodes[n].get("coherence", 0.0)) for n in nodes], float)
+    stab = np.array([float(G.nodes[n].get("stability", G.nodes[n].get("temperature", 0.5)))
+                     for n in nodes], float)
 
-    def norm(a: np.ndarray):
+    def norm(a):
         lo, hi = float(a.min()), float(a.max())
-        if hi - lo < 1e-9:
-            return np.zeros_like(a)
-        return (a - lo) / (hi - lo)
+        return np.zeros_like(a) if hi - lo < 1e-9 else (a - lo) / (hi - lo)
 
-    nd = norm(deg)
-    nt = norm(tf)
-    nc = norm(coh)
-
-    score = 0.35 * nd + 0.30 * nt + 0.35 * nc
+    score = 0.25 * norm(deg) + 0.30 * norm(tf) + 0.25 * norm(coh) + 0.20 * norm(stab)
     return norm(score)
 
 
-def _final_normalisation_sphere(P: np.ndarray) -> np.ndarray:
+def _community_latitudes(community_map: Dict[str, str]) -> Dict[str, float]:
     """
-    Final step: normalise coordinates so max radius = 1.0.
-    Ensures stable rendering in render3d.
+    Assign each community a latitude in [-0.90, +0.90].
+    Communities sorted alphabetically for determinism.
     """
-    radii = np.linalg.norm(P, axis=1)
-    rmax = float(radii.max())
-    if rmax < 1e-9:
-        return P
-    return P / rmax
+    if not community_map:
+        return {}
+
+    comm_ids = sorted(set(community_map.values()))
+    k = len(comm_ids)
+
+    # Avoid poles: keep communities away from +-1
+    lats = np.linspace(0.90, -0.90, k)
+    return {cid: float(lat) for cid, lat in zip(comm_ids, lats)}
+
+
+def _compound_longitude_jitter(compound_map: Dict[str, str], nodes: List[str]) -> Dict[str, float]:
+    """
+    Produce deterministic small longitude offsets per compound so compounds
+    form visible sub-continents inside each community continent.
+    """
+    if not compound_map:
+        return {}
+
+    comp_ids = sorted(set(compound_map.values()))
+    # Map compound -> small angle jitter in [-0.15, 0.15] radians
+    jitter_angles = np.linspace(-0.15, 0.15, len(comp_ids))
+
+    return {cid: float(theta) for cid, theta in zip(comp_ids, jitter_angles)}
 
 
 # ============================================================================ #
-# Public API: spherical manifold layout
+# Public API
 # ============================================================================ #
 
-def compute_layout_3d_spherical(G: nx.Graph) -> Dict[str, Tuple[float, float, float]]:
+def compute_layout_3d_spherical(
+    G: nx.Graph,
+    cluster_info: Optional[object] = None,
+) -> Dict[str, Tuple[float, float, float]]:
     """
-    Compute a 3D spherical manifold layout for the Hilbert graph.
+    Compute a stable 3D spherical manifold layout.
 
-    Steps
-    -----
-    1. Try to extract LSA vectors per node.
-       - If found → use them as direction vectors.
-       - If absent → fallback to spectral embedding.
+    Inputs:
+        - G: element graph
+        - cluster_info: ClusterInfo from analytics.py (optional)
+            Uses:
+              community_ids
+              compound_ids
 
-    2. Normalise vectors to the unit sphere.
-
-    3. Compute importance and assign radius:
-         importance=1 → small radius
-         importance=0 → large radius
-
-    4. Add jitter tangent to sphere to prevent symmetry collapse.
-
-    5. Normalise entire cloud to max radius 1.0.
-
-    6. Return mapping {node: (x, y, z)}.
+    Output:
+        node -> (x, y, z) in unit sphere
     """
     if G.number_of_nodes() == 0:
         return {}
@@ -162,40 +157,84 @@ def compute_layout_3d_spherical(G: nx.Graph) -> Dict[str, Tuple[float, float, fl
     nodes = [str(n) for n in G.nodes()]
     N = len(nodes)
 
-    # Step 1: extract semantic vectors
+    # ---------------------------- #
+    # 1. Semantic base direction
+    # ---------------------------- #
     L = _extract_lsa_vectors(G, nodes)
     if L is None:
         L = _fallback_spectral_embedding(G, nodes)
 
-    # Step 2: normalise to get direction vectors
-    V = _norm_or_zero(L)
+    V = _safe_norm(L)  # semantic vector for each node
 
-    # Step 3: importance → radius (inner = important)
+    # ---------------------------- #
+    # 2. Community → latitude
+    # ---------------------------- #
+    if cluster_info and getattr(cluster_info, "community_ids", None):
+        community_map = cluster_info.community_ids
+        lat_map = _community_latitudes(community_map)
+        latitudes = np.array([lat_map.get(community_map.get(n, ""), 0.0) for n in nodes], float)
+    else:
+        latitudes = np.zeros(N, float)
+
+    # ---------------------------- #
+    # 3. Compound → small longitude jitter
+    # ---------------------------- #
+    if cluster_info and getattr(cluster_info, "compound_ids", None):
+        compound_map = cluster_info.compound_ids
+        lon_jitter_map = _compound_longitude_jitter(compound_map, nodes)
+        jitter = np.array([lon_jitter_map.get(compound_map.get(n, ""), 0.0) for n in nodes], float)
+    else:
+        jitter = np.zeros(N, float)
+
+    # ---------------------------- #
+    # 4. Convert semantic vectors to spherical coords
+    #    Replacing theta/phi with semantic + cluster constraints
+    # ---------------------------- #
+    # Semantic direction gives (vx, vy) → crude longitude seed
+    raw_theta = np.arctan2(V[:, 1], V[:, 0])  # [-π, π]
+    theta = raw_theta + jitter               # compound offset in radians
+
+    # Latitude override replaces V[:,2]
+    phi = np.arcsin(latitudes)               # convert z in [-1,1] to phi
+
+    # ---------------------------- #
+    # 5. Reconstruct 3D coordinates
+    # ---------------------------- #
+    # radius will be added in next step
+    xs = np.cos(phi) * np.cos(theta)
+    ys = np.cos(phi) * np.sin(theta)
+    zs = np.sin(phi)
+
+    B = np.column_stack([xs, ys, zs])
+    B = _safe_norm(B)
+
+    # ---------------------------- #
+    # 6. Importance → radius (shell depth)
+    # ---------------------------- #
     imp = _compute_importance(G, nodes)
-
-    r_inner = 0.55
-    r_outer = 1.00
+    # High importance → inner shell, low importance → outer shell
+    r_inner, r_outer = 0.55, 1.00
     radii = r_inner + (1.0 - imp) * (r_outer - r_inner)
 
-    # Step 4: assign coordinates
-    P = V * radii[:, None]
+    P = B * radii[:, None]
 
-    # Step 5: tangent jitter
-    eps = 0.03
+    # ---------------------------- #
+    # 7. Tangential jitter
+    # ---------------------------- #
     rng = np.random.default_rng(42)
-    jitter = rng.normal(scale=eps, size=P.shape)
+    J = rng.normal(scale=0.03, size=P.shape)
 
-    dot = np.sum(jitter * V, axis=1, keepdims=True)
-    jitter -= dot * V  # remove radial component
-    P += jitter
+    # Remove radial component
+    dot = np.sum(J * B, axis=1, keepdims=True)
+    J -= dot * B
 
-    # Step 6: final normalisation
-    P = _final_normalisation_sphere(P)
+    P += J
 
-    # Return mapping
-    out = {}
-    for i, n in enumerate(nodes):
-        x, y, z = P[i]
-        out[n] = (float(x), float(y), float(z))
+    # ---------------------------- #
+    # 8. Final safety norm
+    # ---------------------------- #
+    norms = np.linalg.norm(P, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1.0
+    P /= norms.max()
 
-    return out
+    return {n: (float(P[i, 0]), float(P[i, 1]), float(P[i, 2])) for i, n in enumerate(nodes)}

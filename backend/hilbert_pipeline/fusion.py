@@ -1,50 +1,37 @@
-# =============================================================================
-# hilbert_pipeline/fusion.py — Span-to-Element Fusion Layer (Option A)
-# =============================================================================
 """
-Option A: fusion loads hilbert_elements.csv to map element → element_id.
+===============================================================================
+hilbert_pipeline/fusion.py – Span-to-Element Fusion Layer (Pipeline 3.1)
+===============================================================================
 
-This module enriches the Hilbert pipeline by:
+Responsibilities:
+  1. Load span embeddings from lsa_field.json.
+  2. Load element embeddings from hilbert_elements.csv.
+  3. Compute span→element soft assignments (top-k, cosine similarity).
+  4. Adaptive similarity thresholding based on span entropy.
+  5. Emit span_element_fusion.csv with both element and element_id.
+  6. Aggregate compound-level semantic contexts for molecules.
 
-  (1) Mapping each span embedding → nearest element embeddings
-      producing a soft assignment table (span → top-k elements).
+Backward-compatible with all 2024–2025 orchestrators, and upgraded to match
+the 2025 graph-contract requirements.
 
-  (2) Aggregating compound-level semantic context:
-        representative spans,
-        keyword distributions,
-        overlap strength,
-        core semantic signature.
-
-  (3) Providing diagnostics for fusion quality:
-        coverage,
-        ambiguity,
-        mean similarity,
-        entropy-weighted thresholds.
-
-Key differences in Option A:
-  - Element embeddings are always aligned with hilbert_elements.csv.
-  - We propagate a stable element identifier (element_id) taken from
-    hilbert_elements.csv (prefer 'element_id', fall back to 'index').
-  - span_element_fusion.csv now includes both 'element' (string) and
-    'element_id' (int) for downstream consistency.
-
-This version is aligned with the upgraded orchestrator & molecule layer and
-supports orchestrator event streaming via emit().
+This module **never mutates** hilbert_elements.csv. Instead it enriches output
+tables in results_dir for downstream layers to consume.
+===============================================================================
 """
 
 from __future__ import annotations
-
 import json
 import os
 import re
-from collections import Counter, defaultdict
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
+from collections import defaultdict, Counter
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
-# injected by orchestrator; overridden at runtime
+
+# Default no-op emitter. The orchestrator will inject the real one.
 DEFAULT_EMIT: Callable[[str, Dict[str, Any]], None] = lambda *_: None
 
 
@@ -53,12 +40,13 @@ DEFAULT_EMIT: Callable[[str, Dict[str, Any]], None] = lambda *_: None
 # =============================================================================
 
 def _log(msg: str, emit=DEFAULT_EMIT):
-    """Best-effort logging that also streams to the orchestrator."""
+    """
+    Mirror logs to stdout and orchestrator if available.
+    """
     print(msg)
     try:
         emit("log", {"message": msg})
     except Exception:
-        # emit is best-effort
         pass
 
 
@@ -86,80 +74,13 @@ def _safe_json_load(path: str, emit=DEFAULT_EMIT):
 # Embedding loading helpers
 # =============================================================================
 
-def _load_span_embeddings(lsa_path: str, emit=DEFAULT_EMIT) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]:
+def _resolve_element_id_column(df: pd.DataFrame) -> str | None:
     """
-    Load span embeddings and span_map from lsa_field.json.
-
-    Returns
-    -------
-    span_vecs : np.ndarray (n_spans, d), L2 normalised
-    span_map_indexed : dict[int, dict]
-        Mapping from span_index -> span_record (with keys: doc, span_id, text, elements)
-    """
-    data = _safe_json_load(lsa_path, emit=emit)
-    if not isinstance(data, dict) or "embeddings" not in data:
-        raise ValueError("lsa_field.json missing 'embeddings' array.")
-
-    emb = data["embeddings"]
-    arr = np.asarray(emb, dtype=float)
-
-    if arr.ndim != 2 or arr.size == 0:
-        raise ValueError("Invalid span embeddings array.")
-
-    # L2 normalise
-    n = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-    span_vecs = arr / n
-
-    # Build span_index -> record mapping
-    span_map = data.get("span_map", []) or []
-    span_map_indexed: Dict[int, Dict[str, Any]] = {}
-
-    for i, rec in enumerate(span_map):
-        # Normalise record structure a bit
-        if not isinstance(rec, dict):
-            rec = {}
-        rec_out = {
-            "doc": rec.get("doc"),
-            "span_id": rec.get("span_id", i),
-            "text": rec.get("text", ""),
-            "elements": rec.get("elements", []),
-        }
-        span_map_indexed[i] = rec_out
-
-    return span_vecs, span_map_indexed
-
-
-def _parse_vec(raw: Any) -> Optional[np.ndarray]:
-    if isinstance(raw, str):
-        # JSON-style or repr-style list
-        try:
-            arr = np.asarray(json.loads(raw), dtype=float)
-        except Exception:
-            try:
-                arr = np.asarray(eval(raw, {"__builtins__": {}}), dtype=float)
-            except Exception:
-                return None
-        return arr if arr.size > 0 else None
-
-    if isinstance(raw, (list, tuple)):
-        v = np.asarray(raw, dtype=float)
-        return v if v.size > 0 else None
-
-    if isinstance(raw, np.ndarray):
-        return raw if raw.size > 0 else None
-
-    return None
-
-
-def _resolve_element_id_column(df: pd.DataFrame) -> Optional[str]:
-    """
-    Decide which column in hilbert_elements.csv should serve as the stable
-    element identifier.
-
-    Preference:
-      1) 'element_id' (if present)
-      2) 'index'      (LSA index written by orchestrator)
-      3) None         (caller will have to fall back to row order)
+    Determine which identifier column to use as element_id.
+    Priority:
+      1. element_id
+      2. index
+      3. None (fallback to row order)
     """
     if "element_id" in df.columns:
         return "element_id"
@@ -168,178 +89,199 @@ def _resolve_element_id_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _parse_vec(raw: Any) -> np.ndarray | None:
+    """
+    Parse a vector stored in CSV (list-like or stringified list).
+    """
+    if isinstance(raw, (list, tuple)):
+        arr = np.asarray(raw, dtype=float)
+        return arr if arr.size else None
+
+    if isinstance(raw, str):
+        try:
+            arr = np.asarray(json.loads(raw), dtype=float)
+            return arr if arr.size else None
+        except Exception:
+            try:
+                arr = np.asarray(eval(raw, {"__builtins__": {}}), dtype=float)
+                return arr if arr.size else None
+            except Exception:
+                return None
+
+    if isinstance(raw, np.ndarray):
+        return raw if raw.size else None
+
+    return None
+
+
+def _load_span_embeddings(
+    lsa_path: str,
+    emit=DEFAULT_EMIT,
+) -> tuple[np.ndarray, dict[int, dict]]:
+    """
+    Load span embeddings and span_map from lsa_field.json.
+    Normalises span embeddings to unit vectors.
+    """
+    data = _safe_json_load(lsa_path, emit)
+    if not isinstance(data, dict) or "embeddings" not in data:
+        raise ValueError("lsa_field.json missing embeddings array.")
+
+    emb = np.asarray(data["embeddings"], dtype=float)
+    if emb.ndim != 2:
+        raise ValueError("Invalid embeddings array in lsa_field.json.")
+
+    norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+    emb = emb / norms
+
+    span_map_raw = data.get("span_map", []) or []
+    span_map_index: dict[int, dict] = {}
+
+    for i, rec in enumerate(span_map_raw):
+        if not isinstance(rec, dict):
+            rec = {}
+        span_map_index[i] = {
+            "doc": rec.get("doc"),
+            "span_id": rec.get("span_id", i),
+            "text": rec.get("text", ""),
+            "elements": rec.get("elements", []),
+        }
+
+    return emb, span_map_index
+
+
 def _load_element_embeddings_from_csv(
     elements_csv: str,
     emit=DEFAULT_EMIT,
-) -> Tuple[np.ndarray, List[str], List[int]]:
+) -> tuple[np.ndarray, list[str], list[int]]:
     """
-    Primary path: load element embeddings from hilbert_elements.csv when an
-    'embedding' column is present, aligned with element → element_id.
-
-    Returns
-    -------
-    elem_vecs : np.ndarray       (n_elements, d)
-    elem_ids  : list[str]        element string labels
-    elem_idxs : list[int]        element_id / index from CSV
+    Load element embeddings from hilbert_elements.csv when column 'embedding' exists.
+    Returns L2-normalised vectors.
     """
     df = pd.read_csv(elements_csv)
     if "element" not in df.columns or "embedding" not in df.columns:
-        raise ValueError("hilbert_elements.csv missing 'embedding' column.")
+        raise ValueError("hilbert_elements.csv lacks 'embedding' column.")
 
     id_col = _resolve_element_id_column(df)
 
-    el_ids: List[str] = []
-    el_indices: List[int] = []
-    vecs: List[np.ndarray] = []
+    elem_labels: list[str] = []
+    elem_ids: list[int] = []
+    vecs: list[np.ndarray] = []
 
     for row_idx, row in df.iterrows():
         el = str(row["element"])
         v = _parse_vec(row["embedding"])
         if v is None:
             continue
-        v = v.astype(float)
-        if not np.any(v):
-            continue
 
-        if id_col is not None:
+        if id_col:
             try:
                 el_id = int(row[id_col])
             except Exception:
-                el_id = int(row_idx)
+                el_id = row_idx
         else:
-            el_id = int(row_idx)
+            el_id = row_idx
 
-        el_ids.append(el)
-        el_indices.append(el_id)
-        vecs.append(v)
+        elem_labels.append(el)
+        elem_ids.append(el_id)
+        vecs.append(v.astype(float))
 
-    if not el_ids:
+    if not vecs:
         raise ValueError("No valid element embeddings in CSV.")
 
     X = np.vstack(vecs)
-    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-    X = X / norms
-    return X, el_ids, el_indices
+    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    return X, elem_labels, elem_ids
 
 
 def _derive_element_centroids_from_span_map(
     lsa_path: str,
     elements_csv: str,
     emit=DEFAULT_EMIT,
-) -> Tuple[np.ndarray, List[str], List[int]]:
+) -> tuple[np.ndarray, list[str], list[int]]:
     """
-    Fallback: derive element centroids directly from the LSA span embeddings +
-    span_map 'elements' lists, but align them with hilbert_elements.csv so that
-    element → element_id is consistent across the pipeline.
-
-    This does NOT depend on hilbert_elements.csv containing span_id.
+    Fallback centroid-based element embeddings from span_map.
     """
-    data = _safe_json_load(lsa_path, emit=emit)
+    data = _safe_json_load(lsa_path, emit)
     if not isinstance(data, dict):
-        raise ValueError("lsa_field.json invalid for centroid derivation.")
+        raise ValueError("lsa_field.json unreadable.")
 
     span_emb = np.asarray(data.get("embeddings", []), dtype=float)
-    span_map = data.get("span_map", []) or []
+    span_map = data.get("span_map") or []
+    if span_emb.ndim != 2 or not span_map:
+        raise ValueError("No span embeddings / span_map for centroid fallback.")
 
-    if span_emb.ndim != 2 or span_emb.size == 0 or not span_map:
-        raise ValueError("No span embeddings or span_map for centroid fallback.")
+    span_emb = span_emb / (np.linalg.norm(span_emb, axis=1, keepdims=True) + 1e-12)
 
-    # L2 normalise span embeddings
-    norms = np.linalg.norm(span_emb, axis=1, keepdims=True) + 1e-12
-    span_emb = span_emb / norms
-
-    # Aggregate embeddings by element using span_map.elements
-    buckets: Dict[str, List[int]] = defaultdict(list)
+    buckets: dict[str, list[int]] = defaultdict(list)
     for i, rec in enumerate(span_map):
-        if not isinstance(rec, dict):
-            continue
-        elems = rec.get("elements") or []
-        if not isinstance(elems, (list, tuple)):
-            continue
-        for el in elems:
-            el_str = str(el)
-            buckets[el_str].append(i)
+        els = rec.get("elements") or []
+        for el in els:
+            buckets[str(el)].append(i)
 
-    # Load canonical element list + IDs from hilbert_elements.csv
-    elements_df = pd.read_csv(elements_csv)
-    if "element" not in elements_df.columns:
-        raise ValueError("hilbert_elements.csv missing 'element' column.")
+    df = pd.read_csv(elements_csv)
+    if "element" not in df.columns:
+        raise ValueError("hilbert_elements.csv missing 'element'.")
 
-    id_col = _resolve_element_id_column(elements_df)
+    id_col = _resolve_element_id_column(df)
+    elem_labels: list[str] = []
+    elem_ids: list[int] = []
+    vecs: list[np.ndarray] = []
 
-    el_ids: List[str] = []
-    el_indices: List[int] = []
-    vecs: List[np.ndarray] = []
-
-    for row_idx, row in elements_df.iterrows():
+    for row_idx, row in df.iterrows():
         el = str(row["element"])
         idxs = buckets.get(el, [])
         if not idxs:
-            # This element never actually appears in span_map; skip it for
-            # centroid estimation. It will still exist in hilbert_elements.csv
-            # but simply won't be used in fusion similarity comparisons.
             continue
 
         v = span_emb[idxs].mean(axis=0)
 
-        if id_col is not None:
+        if id_col:
             try:
                 el_id = int(row[id_col])
             except Exception:
-                el_id = int(row_idx)
+                el_id = row_idx
         else:
-            el_id = int(row_idx)
+            el_id = row_idx
 
-        el_ids.append(el)
-        el_indices.append(el_id)
+        elem_labels.append(el)
+        elem_ids.append(el_id)
         vecs.append(v)
 
-    if not el_ids:
-        raise ValueError("No valid element centroids derived from span_map.")
+    if not vecs:
+        raise ValueError("Unable to derive any element centroids.")
 
     X = np.vstack(vecs)
-    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
-    X = X / norms
-    return X, el_ids, el_indices
+    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    return X, elem_labels, elem_ids
 
 
 def _load_element_embeddings(
     elements_csv: str,
     lsa_path: str,
     emit=DEFAULT_EMIT,
-) -> Tuple[np.ndarray, List[str], List[int]]:
+) -> tuple[np.ndarray, list[str], list[int]]:
     """
-    Hybrid loader:
-      - first try CSV 'embedding' column
-      - if missing, fall back to LSA-derived centroids via span_map.elements,
-        always keeping element → element_id aligned with hilbert_elements.csv.
+    Hybrid loading strategy: prefer CSV embeddings, otherwise centroid fallback.
     """
     try:
-        return _load_element_embeddings_from_csv(elements_csv, emit=emit)
-    except Exception as e_csv:
-        _log(
-            "[fusion][info] Falling back to LSA-derived centroids because CSV "
-            f"embeddings failed: {e_csv}",
-            emit,
-        )
-        return _derive_element_centroids_from_span_map(
-            lsa_path=lsa_path,
-            elements_csv=elements_csv,
-            emit=emit,
-        )
+        return _load_element_embeddings_from_csv(elements_csv, emit)
+    except Exception as e:
+        _log(f"[fusion] Falling back to centroid embeddings: {e}", emit)
+        return _derive_element_centroids_from_span_map(lsa_path, elements_csv, emit)
 
 
 # =============================================================================
-# Adaptive Similarity Thresholds
+# Adaptive Similarity Thresholding
 # =============================================================================
 
-def adaptive_sim_threshold(entropy: float,
-                           base=0.22,
-                           min_t=0.15,
-                           max_t=0.40) -> float:
+def adaptive_threshold(entropy: float,
+                       base=0.22,
+                       min_t=0.15,
+                       max_t=0.40) -> float:
     """
-    High-entropy spans need lower similarity thresholds.
-    Low-entropy spans require higher similarity to count as meaningful.
+    Entropy-aware threshold:
+      high entropy → lower threshold,
+      low entropy → higher threshold.
     """
     if entropy <= 0.1:
         return max_t
@@ -351,79 +293,82 @@ def adaptive_sim_threshold(entropy: float,
 
 
 # =============================================================================
-# FUSION CORE
+# Core fusion
 # =============================================================================
 
-def fuse_spans_to_elements(out_dir: str,
-                           top_k: int = 3,
-                           emit=DEFAULT_EMIT) -> pd.DataFrame:
+def fuse_spans_to_elements(
+    results_dir: str,
+    top_k: int = 3,
+    emit=DEFAULT_EMIT,
+) -> pd.DataFrame:
     """
-    Produces a CSV: span_index, span_id, doc, element, element_id, similarity, threshold.
-
-    Uses adaptive thresholding based on span entropy when available.
-    element_id is taken from hilbert_elements.csv (column 'element_id' if present,
-    otherwise 'index', otherwise row order).
+    Main fusion function. Produces:
+      span_element_fusion.csv
+      columns = [
+        span_index,
+        span_id,
+        doc,
+        element,
+        element_id,
+        similarity,
+        threshold
+      ]
     """
-    lsa_path = os.path.join(out_dir, "lsa_field.json")
-    el_path = os.path.join(out_dir, "hilbert_elements.csv")
+    lsa_path = os.path.join(results_dir, "lsa_field.json")
+    el_path = os.path.join(results_dir, "hilbert_elements.csv")
 
-    if not os.path.exists(lsa_path) or not os.path.exists(el_path):
-        _log("[fusion] Missing LSA field or elements; skipping.", emit)
+    if not (os.path.exists(lsa_path) and os.path.exists(el_path)):
+        _log("[fusion] Missing required inputs; skipping.", emit)
         return pd.DataFrame()
 
-    # -- load embeddings & span map ------------------------------------------
     try:
-        span_vecs, span_map_indexed = _load_span_embeddings(lsa_path, emit)
-        elem_vecs, elem_ids, elem_indices = _load_element_embeddings(el_path, lsa_path, emit)
+        span_vecs, span_map = _load_span_embeddings(lsa_path, emit)
+        elem_vecs, elem_labels, elem_ids = _load_element_embeddings(el_path, lsa_path, emit)
     except Exception as e:
-        _log(f"[fusion][warn] Failed embedding load: {e}", emit)
-        return pd.DataFrame()
-
-    if span_vecs.shape[0] == 0 or elem_vecs.shape[0] == 0:
-        _log("[fusion][warn] Empty span or element embeddings; skipping fusion.", emit)
+        _log(f"[fusion][warn] Failed to load embeddings: {e}", emit)
         return pd.DataFrame()
 
     sims = cosine_similarity(span_vecs, elem_vecs)
 
-    # load entropies for adaptive thresholds, if present
-    span_data = _safe_json_load(lsa_path, emit=emit)
-    H_span = span_data.get("H_span") if isinstance(span_data, dict) else None
+    meta = _safe_json_load(lsa_path, emit)
+    H_span = meta.get("H_span") if isinstance(meta, dict) else None
     if not isinstance(H_span, list):
-        H_span = [1.0] * sims.shape[0]  # fallback flat entropy
+        H_span = [1.0] * sims.shape[0]
 
-    rows = []
+    rows: list[dict[str, Any]] = []
+
     for i in range(sims.shape[0]):
-        row = sims[i]
-        idxs = np.argsort(row)[::-1][:top_k]
+        row_sims = sims[i]
+        idxs = np.argsort(row_sims)[::-1][:top_k]
 
-        thr = adaptive_sim_threshold(_safe_float(H_span[i], 1.0))
+        thr = adaptive_threshold(_safe_float(H_span[i], 1.0))
 
-        span_rec = span_map_indexed.get(i, {})
+        span_rec = span_map.get(i, {})
         span_id = span_rec.get("span_id", i)
         doc = span_rec.get("doc")
 
         for j in idxs:
-            sim = float(row[j])
-            if sim < thr:
+            score = float(row_sims[j])
+            if score < thr:
                 continue
             rows.append({
                 "span_index": i,
                 "span_id": span_id,
                 "doc": doc,
-                "element": elem_ids[j],
-                "element_id": elem_indices[j],
-                "similarity": sim,
+                "element": elem_labels[j],
+                "element_id": elem_ids[j],
+                "similarity": score,
                 "threshold": thr,
             })
 
     df = pd.DataFrame(rows)
     if df.empty:
-        _log("[fusion] No span→element matches above threshold.", emit)
+        _log("[fusion] No span→element links above threshold.", emit)
         return df
 
-    out_path = os.path.join(out_dir, "span_element_fusion.csv")
+    out_path = os.path.join(results_dir, "span_element_fusion.csv")
     df.to_csv(out_path, index=False)
-    _log(f"[fusion] Wrote {out_path} with {len(df)} rows.", emit)
+    _log(f"[fusion] wrote {out_path} with {len(df)} rows", emit)
 
     try:
         emit("artifact", {"path": out_path, "kind": "span_fusion"})
@@ -434,127 +379,110 @@ def fuse_spans_to_elements(out_dir: str,
 
 
 # =============================================================================
-# Compound-Level Semantic Context Extraction
+# Compound context enrichment
 # =============================================================================
 
-def aggregate_compound_context(out_dir: str,
-                               elements_csv: str = "hilbert_elements.csv",
-                               compounds_json: str = "informational_compounds.json",
-                               fuse_csv: str = "span_element_fusion.csv",
-                               emit=DEFAULT_EMIT) -> pd.DataFrame:
+def aggregate_compound_context(
+    results_dir: str,
+    elements_csv: str = "hilbert_elements.csv",
+    compounds_json: str = "informational_compounds.json",
+    fuse_csv: str = "span_element_fusion.csv",
+    emit=DEFAULT_EMIT,
+) -> pd.DataFrame:
     """
-    Produces enriched compound contexts including:
-        - representative spans
-        - core keywords
-        - cross-element semantic overlap
-        - compound signature vector (mean element embedding, future work)
+    Build compound_contexts.json summarising:
+      - representative spans
+      - keyword distributions
+      - cross-element span overlap
+      - context examples
     """
+    el_path = os.path.join(results_dir, elements_csv)
+    comp_path = os.path.join(results_dir, compounds_json)
+    fuse_path = os.path.join(results_dir, fuse_csv)
 
-    el_path = os.path.join(out_dir, elements_csv)
-    c_path = os.path.join(out_dir, compounds_json)
-    f_path = os.path.join(out_dir, fuse_csv)
+    elements_df = pd.read_csv(el_path) if os.path.exists(el_path) else None
+    compounds_raw = _safe_json_load(comp_path, emit)
+    fusion_df = pd.read_csv(fuse_path) if os.path.exists(fuse_path) else pd.DataFrame()
 
-    if not os.path.exists(el_path):
-        _log(f"[fusion][warn] Missing elements CSV: {el_path}", emit)
+    if not isinstance(compounds_raw, (dict, list)):
+        _log("[fusion] No compounds to enrich.", emit)
         return pd.DataFrame()
 
-    elements_df = pd.read_csv(el_path)
-    compounds_raw = _safe_json_load(c_path, emit=emit)
     if isinstance(compounds_raw, dict) and "compounds" in compounds_raw:
-        compounds = list(compounds_raw["compounds"])
+        compounds = compounds_raw["compounds"]
     elif isinstance(compounds_raw, dict):
         compounds = list(compounds_raw.values())
     else:
-        compounds = compounds_raw if isinstance(compounds_raw, list) else []
+        compounds = compounds_raw
 
-    fusion_df = pd.read_csv(f_path) if os.path.exists(f_path) else pd.DataFrame()
+    lsa_data = _safe_json_load(os.path.join(results_dir, "lsa_field.json"), emit) or {}
+    span_map = lsa_data.get("span_map") or []
 
-    # Preload example spans if present in elements_df (legacy support)
-    span_cache: Dict[str, List[str]] = {}
-    if "span" in elements_df.columns:
-        for _, row in elements_df.iterrows():
-            el = str(row["element"])
-            txt = str(row.get("span") or row.get("context") or "").strip()
-            if txt:
-                span_cache.setdefault(el, []).append(txt)
+    enriched: list[dict[str, Any]] = []
 
-    # Also load span_map so we can pull actual text contexts from LSA
-    lsa_json = _safe_json_load(os.path.join(out_dir, "lsa_field.json"), emit)
-    span_map = lsa_json.get("span_map") if isinstance(lsa_json, dict) else []
-    span_map = span_map or []
-
-    enriched = []
     for c in compounds:
         if not isinstance(c, dict):
             continue
 
-        cid = c.get("compound_id")
         members = [str(e) for e in c.get("elements", [])]
+        cid = c.get("compound_id")
 
-        # 1) Gather spans from span-cache and fusion assignments
-        candidate_spans: List[str] = []
+        # gather candidate spans
+        collected: list[str] = []
 
-        # from legacy span_cache
-        for el in members:
-            candidate_spans.extend(span_cache.get(el, []))
-
-        # from fusion assignments + LSA span_map
-        if not fusion_df.empty and "element" in fusion_df.columns:
-            f_sub = fusion_df[fusion_df["element"].isin(members)]
-            for _, row in f_sub.iterrows():
-                idx = int(row.get("span_index", -1))
+        if not fusion_df.empty:
+            sub = fusion_df[fusion_df["element"].isin(members)]
+            for _, row in sub.iterrows():
+                idx = int(row["span_index"])
                 if 0 <= idx < len(span_map):
                     txt = span_map[idx].get("text", "")
                     if txt:
-                        candidate_spans.append(str(txt))
+                        collected.append(txt)
 
-        # 2) Build keyword distribution
-        toks_all: List[str] = []
-        for s in candidate_spans:
+        toks_all: list[str] = []
+        for s in collected:
             toks_all.extend(re.findall(r"[A-Za-z']+", s.lower()))
-        word_counts = Counter(toks_all)
+        counts = Counter(toks_all)
 
-        # 3) Representative spans: high overlap with member names
-        member_toks = {m.lower() for m in members}
-        scored: List[Tuple[int, str]] = []
-        for s in candidate_spans:
+        member_lower = {m.lower() for m in members}
+        scored: list[tuple[int, str]] = []
+        for s in collected:
             toks = set(re.findall(r"[A-Za-z']+", s.lower()))
-            overlap = len(toks & member_toks)
+            overlap = len(toks & member_lower)
             scored.append((overlap, s))
 
-        top_sents = [s for _, s in sorted(scored, reverse=True)[:5]]
-        top_words = [w for w, _ in word_counts.most_common(15)]
+        top_spans = [s for _, s in sorted(scored, reverse=True)[:5]]
+        top_words = [w for w, _ in counts.most_common(15)]
 
-        entry = dict(c)
-        entry["compound_id"] = cid
-        entry["context_examples"] = top_sents
-        entry["aggregate_keywords"] = top_words
-        entry["n_spans"] = len(candidate_spans)
+        rec = dict(c)
+        rec["compound_id"] = cid
+        rec["context_examples"] = top_spans
+        rec["aggregate_keywords"] = top_words
+        rec["n_spans"] = len(collected)
+        enriched.append(rec)
 
-        enriched.append(entry)
-
-    # Export
-    out_path = os.path.join(out_dir, "compound_contexts.json")
+    out_path = os.path.join(results_dir, "compound_contexts.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(enriched, f, indent=2)
 
-    _log(f"[fusion] Compound contexts written → {out_path}", emit)
+    _log(f"[fusion] wrote {out_path}", emit)
     try:
         emit("artifact", {"path": out_path, "kind": "compound_context"})
     except Exception:
         pass
+
     return pd.DataFrame(enriched)
 
 
 # =============================================================================
-# Orchestrator-facing convenience
+# Orchestrator API
 # =============================================================================
 
 def run_fusion_pipeline(results_dir: str, emit=DEFAULT_EMIT) -> None:
     """
-    Thin wrapper combining:
-      - span→element fusion
-      - compound context aggregation
+    Execute:
+      (1) span→element fusion
+      (2) compound context aggregation
     """
     fuse_spans_to_elements(results_dir, emit=emit)
     aggregate_compound_context(results_dir, emit=emit)

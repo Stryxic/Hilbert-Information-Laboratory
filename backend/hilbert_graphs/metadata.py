@@ -1,12 +1,27 @@
 """
-Metadata and index writing for graph snapshots.
+Modular scientific metadata writers for Hilbert graph snapshots.
 
-This module produces:
-    - Per-snapshot metadata JSON files (graph_XXX.meta.json)
-    - A global snapshot index (graph_snapshots_index.json)
+New in v2 (Option 2 architecture):
 
-It is intentionally simple, deterministic, and versioned so downstream
-tools (dashboard, API clients, notebooks) can rely on consistent fields.
+We now produce FOUR metadata outputs:
+
+1. graph_metadata_core.json
+      - stable top-level run metadata (version, seeds, upstream LSA config, pruning info)
+
+2. graph_layout.json
+      - 2D/3D layout parameters, community latitudes, radius bounds, timings
+
+3. graph_analytics.json
+      - cluster sizes, component sizes, compound statistics, root summaries
+
+4. graph_diagnostics.json
+      - paths to diagnostic plots (degree hist, component hist, community panels, etc.)
+
+Plus the existing:
+5. graph_snapshots_index.json
+      - lightweight index referencing snapshot metadata & pointers to the above files.
+
+Snapshot-level .meta.json files are unchanged.
 """
 
 from __future__ import annotations
@@ -14,184 +29,254 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Union
 
 from .analytics import GraphStats
 
+META_VERSION = "hilbert.graphmeta.v2"
+INDEX_VERSION = "hilbert.snapshot.index.v2"
 
-# ============================================================================ #
-# Utility: robust JSON writing
-# ============================================================================ #
 
-def _safe_write_json(path: str, payload: Dict[str, Any], emit=None) -> None:
+# --------------------------------------------------------------------------- #
+# Utility helpers
+# --------------------------------------------------------------------------- #
+
+def _stats_to_dict(stats: Union[GraphStats, Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Safely write JSON with directory creation and logging.
+    Convert either a GraphStats dataclass or a dict into a stable,
+    serialisable dictionary.
     """
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        if emit:
-            emit("log", {"message": f"[metadata] wrote {path}"})
-    except Exception as e:
-        if emit:
-            emit("log", {
-                "message": f"[metadata] failed to write {path}: {e}",
-                "error": str(e)
-            })
-
-
-# ============================================================================ #
-# Snapshot metadata writer
-# ============================================================================ #
-
-def write_snapshot_metadata(
-    results_dir: str,
-    snapshot_name: str,
-    snapshot_name_3d: Optional[str],
-    stats: GraphStats,
-    pct: Optional[float],
-    top_nodes: List[str],
-    layout_info: Optional[Dict[str, Any]] = None,
-    emit=None,
-) -> Dict[str, Any]:
-    """
-    Write metadata describing a single graph snapshot.
-
-    Parameters
-    ----------
-    results_dir : str
-        Path to Hilbert run directory.
-    snapshot_name : str
-        2D PNG file name, e.g. "graph_10pct.png".
-    snapshot_name_3d : str | None
-        3D PNG name if produced.
-    stats : GraphStats
-        Basic graph statistics.
-    pct : float | None
-        Percentage used by the snapshot; None for structural snapshots.
-    top_nodes : list[str]
-        The most important nodes in the snapshot.
-    layout_info : dict | None
-        Optional layout metadata (layout mode, seed, parameters, etc).
-    emit : callable
-        Optional Hilbert emitter.
-
-    Returns
-    -------
-    dict
-        The metadata dictionary (also persisted to disk).
-    """
-
-    meta = {
-        "version": "hilbert.graphmeta.v1",
-        "timestamp": time.time(),
-
-        "snapshot": snapshot_name,
-        "snapshot_3d": snapshot_name_3d,
-
-        "pct": pct,
-
-        "stats": {
+    if isinstance(stats, GraphStats):
+        return {
             "n_nodes": stats.n_nodes,
             "n_edges": stats.n_edges,
             "density": stats.density,
             "avg_degree": stats.avg_degree,
             "transitivity": stats.transitivity,
-        },
+        }
 
-        "top_nodes": top_nodes,
-        "layout": layout_info or {},
+    # assume dict-like
+    return {
+        "n_nodes": stats.get("n_nodes", 0),
+        "n_edges": stats.get("n_edges", 0),
+        "density": stats.get("density", 0.0),
+        "avg_degree": stats.get("avg_degree", 0.0),
+        "transitivity": stats.get("transitivity", 0.0),
     }
 
-    out_path = os.path.join(
-        results_dir,
-        snapshot_name.replace(".png", ".meta.json")
-    )
-    _safe_write_json(out_path, meta, emit=emit)
 
-    return meta
-
-
-# ============================================================================ #
-# Global index writer
-# ============================================================================ #
-
-def write_global_index(
-    results_dir: str,
-    global_stats: GraphStats,
-    snapshot_entries: List[Dict[str, Any]],
-    config_info: Dict[str, Any],
-    emit=None,
-) -> None:
+@dataclass
+class SnapshotMeta:
     """
-    Write the global graph snapshot index.
-
-    This provides a single entry point for dashboard integrations.
+    Per-snapshot metadata written to <snapshot>.meta.json.
     """
-
-    payload = {
-        "version": "hilbert.snapshot.index.v1",
-        "timestamp": time.time(),
-
-        "global_stats": {
-            "n_nodes": global_stats.n_nodes,
-            "n_edges": global_stats.n_edges,
-            "density": global_stats.density,
-            "avg_degree": global_stats.avg_degree,
-            "transitivity": global_stats.transitivity,
-        },
-
-        "config": config_info or {},
-        "snapshots": snapshot_entries,
-    }
-
-    index_path = os.path.join(results_dir, "graph_snapshots_index.json")
-    _safe_write_json(index_path, payload, emit=emit)
+    version: str
+    timestamp: float
+    snapshot: str
+    snapshot_3d: Optional[str]
+    pct: float
+    stats: Dict[str, Any]
+    top_nodes: List[str]
+    layout: Dict[str, Any]
+    diagnostics: Optional[Dict[str, str]] = None
 
 
-# ============================================================================ #
-# Metadata merge helper
-# ============================================================================ #
+# --------------------------------------------------------------------------- #
+# Snapshot-level metadata writers
+# --------------------------------------------------------------------------- #
 
-def merge_snapshot_metadata(
-    base: Dict[str, Any],
-    extra: Dict[str, Any],
+def write_snapshot_metadata(
+    out_dir: str,
+    snapshot_name: str,
+    snapshot_name_3d: Optional[str],
+    pct: float,
+    stats: Union[GraphStats, Dict[str, Any]],
+    top_nodes: List[str],
+    layout_info: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Merge two metadata dictionaries in a stable, predictable way.
+    Write a single snapshot metadata JSON file.
 
-    Rules:
-        - Keys in `extra` override keys in `base`
-        - Lists concatenate uniquely (order preserved)
-        - Dicts merge shallowly
-        - All other values overwrite directly
-
-    This allows 2D and 3D renderers to write metadata independently,
-    then merge their results into a unified record.
+    Returned as a dict so visualizer.py can embed it into the global index
+    or other aggregation documents.
     """
+    stats_dict = _stats_to_dict(stats)
 
-    out = dict(base)
+    meta_obj = SnapshotMeta(
+        version=META_VERSION,
+        timestamp=time.time(),
+        snapshot=snapshot_name,
+        snapshot_3d=snapshot_name_3d,
+        pct=float(pct),
+        stats=stats_dict,
+        top_nodes=list(top_nodes),
+        layout=dict(layout_info or {}),
+        diagnostics=diagnostics or {},
+    )
 
-    for key, val in extra.items():
-        if key not in out:
-            out[key] = val
-            continue
+    meta_dict = asdict(meta_obj)
+    path = os.path.join(out_dir, f"{snapshot_name}.meta.json")
 
-        # merge lists (unique)
-        if isinstance(out[key], list) and isinstance(val, list):
-            merged = list(dict.fromkeys(out[key] + val))
-            out[key] = merged
-            continue
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta_dict, f, indent=2)
 
-        # merge nested dictionaries
-        if isinstance(out[key], dict) and isinstance(val, dict):
-            merged = dict(out[key])
-            merged.update(val)
-            out[key] = merged
-            continue
+    return meta_dict
 
-        # default: overwrite
-        out[key] = val
 
+def merge_snapshot_metadata(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Pass-through normaliser; ensures all items are plain dicts.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in metas:
+        if isinstance(m, dict):
+            out.append(m)
+        else:
+            out.append(asdict(m))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Modular metadata writers (Option 2 architecture)
+# --------------------------------------------------------------------------- #
+
+def write_metadata_core(
+    out_dir: str,
+    *,
+    version: str,
+    run_seed: int,
+    orchestrator_version: str,
+    lsa_model_version: Optional[str],
+    embedding_parameters: Optional[Dict[str, Any]],
+    cluster_hierarchy_info: Optional[Dict[str, Any]],
+    pruning_info: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Write graph_metadata_core.json containing stable upstream provenance.
+    """
+    core = {
+        "version": version,
+        "timestamp": time.time(),
+        "run_seed": run_seed,
+        "orchestrator_version": orchestrator_version,
+        "lsa_model_version": lsa_model_version,
+        "embedding_parameters": embedding_parameters,
+        "cluster_hierarchy_info": cluster_hierarchy_info,
+        "pruning": pruning_info,
+    }
+
+    path = os.path.join(out_dir, "graph_metadata_core.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(core, f, indent=2)
+
+    return path
+
+
+def write_metadata_layout(
+    out_dir: str,
+    layout2d: Dict[str, Any],
+    layout3d: Dict[str, Any],
+) -> str:
+    """
+    Layout parameters (seeds, latitudes, radius bounds, timings).
+    """
+    data = {
+        "version": META_VERSION,
+        "timestamp": time.time(),
+        "layout2d": layout2d,
+        "layout3d": layout3d,
+    }
+
+    path = os.path.join(out_dir, "graph_layout.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return path
+
+
+def write_metadata_analytics(
+    out_dir: str,
+    *,
+    global_stats: Dict[str, Any],
+    community_sizes: Dict[str, int],
+    component_sizes: Dict[str, int],
+    compound_summary: Dict[str, Any],
+    root_summary: Dict[str, Any],
+) -> str:
+    """
+    Analytics-level metadata (clusters, components, compounds).
+    """
+    data = {
+        "version": META_VERSION,
+        "timestamp": time.time(),
+        "global_stats": global_stats,
+        "community_sizes": community_sizes,
+        "component_sizes": component_sizes,
+        "compound_summary": compound_summary,
+        "root_summary": root_summary,
+    }
+
+    path = os.path.join(out_dir, "graph_analytics.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return path
+
+
+def write_metadata_diagnostics(
+    out_dir: str,
+    diagnostics: Dict[str, str],
+) -> str:
+    """
+    Scientific diagnostic plot index.
+    """
+    data = {
+        "version": META_VERSION,
+        "timestamp": time.time(),
+        "diagnostics": diagnostics or {},
+    }
+
+    path = os.path.join(out_dir, "graph_diagnostics.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Global index (entrypoint) - now lightweight
+# --------------------------------------------------------------------------- #
+
+def write_global_index(
+    out_dir: str,
+    global_stats: Union[GraphStats, Dict[str, Any]],
+    snapshot_meta_dicts: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    *,
+    metadata_files: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    Write graph_snapshots_index.json:
+
+    This is now a *thin pointer document* referencing:
+      - snapshot meta dicts
+      - separate modular metadata files (core/layout/analytics/diagnostics)
+    """
+    gs = _stats_to_dict(global_stats)
+
+    index = {
+        "version": INDEX_VERSION,
+        "timestamp": time.time(),
+        "global_stats": gs,
+        "config": config,
+        "snapshots": merge_snapshot_metadata(snapshot_meta_dicts),
+        "metadata_files": metadata_files or {},  # pointers to the four new JSON files
+    }
+
+    path = os.path.join(out_dir, "graph_snapshots_index.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2)
+
+    return path

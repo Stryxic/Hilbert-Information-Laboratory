@@ -1,5 +1,5 @@
 """
-Hilbert Orchestrator 3.1
+Hilbert Orchestrator 3.2
 
 Declarative, dialectical orchestration of the Hilbert information pipeline.
 
@@ -21,9 +21,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional
 import shutil
+import random
 
 import numpy as np
 import pandas as pd
+
+ORCHESTRATOR_VERSION = "3.2"
 
 # -----------------------------------------------------------------------------
 # Optional PDF support (for corpus normalisation)
@@ -75,6 +78,8 @@ try:
         run_fusion_pipeline,
         # Molecules
         run_molecule_layer,
+        # Element roots (consolidator)
+        run_element_roots,
         # Stability
         compute_signal_stability,
         # Persistence
@@ -82,14 +87,16 @@ try:
         run_persistence_visuals,
         # Epistemic signatures
         compute_signatures,
-        # Full export (PDF + ZIP)
-        run_full_export,
         # Element LM
         run_element_lm_stage,
+        # Graph edges
         build_element_edges,
+        # LM perplexity (Ollama / LLM pipeline)
         compute_corpus_perplexity,
+        # Compound stability
         compute_compound_stability,
     )
+    from hilbert_pipeline.hilbert_report import run_hilbert_report
 except Exception as exc:  # very defensive import
     raise RuntimeError(f"[orchestrator] Failed to import hilbert_pipeline: {exc}") from exc
 
@@ -262,12 +269,13 @@ class PipelineContext:
     # --- run summary --------------------------------------------------------
 
     def run_summary(self, specs: List[StageSpec]) -> Dict[str, Any]:
-        # Important: we DO NOT dump ctx.extras here to keep things JSON-safe.
+        # Important: we do not dump ctx.extras here to keep things JSON-safe.
         return {
             "run_id": self.run_id,
             "corpus_dir": self.corpus_dir,
             "results_dir": self.results_dir,
             "settings": self.settings.__dict__,
+            "orchestrator_version": ORCHESTRATOR_VERSION,
             "stages": {
                 key: {
                     "label": st.label,
@@ -352,7 +360,18 @@ def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
                 )
                 n_skipped += 1
 
-        elif ext in (".txt", ".md", ".tex", ".py", ".c", ".h", ".cpp", ".hpp", ".cc", ".java"):
+        elif ext in (
+            ".txt",
+            ".md",
+            ".tex",
+            ".py",
+            ".c",
+            ".h",
+            ".cpp",
+            ".hpp",
+            ".cc",
+            ".java",
+        ):
             # For text and source files, just copy them; the LSA layer
             # will do format-aware cleaning based on the extension.
             out_path = out_dir / rel.name
@@ -374,7 +393,6 @@ def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
             n_skipped += 1
             continue
 
-
     ctx.log(
         "info",
         "[lsa] Prepared normalised LSA corpus",
@@ -386,7 +404,6 @@ def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
         skipped=n_skipped,
     )
     return str(dst_root)
-
 
 
 # -----------------------------------------------------------------------------
@@ -410,6 +427,22 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     # Important: use the same call shape as your working version
     res = build_lsa_field(lsa_root, emit=ctx.emit) or {}
     ctx.extras["lsa_result"] = res
+
+    # Attempt to cache embedding config for graph metadata
+    lsa_cfg = res.get("config") or {}
+    ctx.extras["embedding_parameters"] = (
+        lsa_cfg.get("embedding_parameters")
+        or {
+            "model": lsa_cfg.get("model", "svd"),
+            "n_components": lsa_cfg.get("n_components"),
+            "normalisation": lsa_cfg.get("normalisation"),
+        }
+    )
+    ctx.extras["lsa_model_version"] = (
+        lsa_cfg.get("model_version")
+        or lsa_cfg.get("version")
+        or "unknown"
+    )
 
     elements = res.get("elements", []) or []
     metrics = res.get("element_metrics", []) or []
@@ -476,7 +509,7 @@ def _stage_lsa(ctx: PipelineContext) -> None:
     # ------------------------------------------------------------------
     # LSA layer no longer computes edges internally
     # ------------------------------------------------------------------
-    ctx.log("info", "[lsa] Edge generation disabled – handled by stage_edges")
+    ctx.log("info", "[lsa] Edge generation disabled - handled by stage_edges")
 
     # ---------------------------------------------
     # Write LSA field (flat for compatibility)
@@ -508,7 +541,7 @@ def _stage_edges(ctx: PipelineContext) -> None:
 
 def _stage_molecules(ctx: PipelineContext) -> None:
     """
-    Molecule construction & compounds.
+    Molecule construction and compounds.
 
     Uses run_molecule_layer(results_dir, emit) from hilbert_pipeline.
 
@@ -518,7 +551,7 @@ def _stage_molecules(ctx: PipelineContext) -> None:
     """
     mol_df, comp_df = run_molecule_layer(
         ctx.results_dir,
-        emit=ctx.emit
+        emit=ctx.emit,
     )
 
     # Molecule table
@@ -530,19 +563,42 @@ def _stage_molecules(ctx: PipelineContext) -> None:
         except Exception as exc:
             ctx.log("warn", f"Failed to write molecules.csv: {exc}")
 
-    # Compound JSON – produced by the molecule layer
+    # Compound JSON - produced by the molecule layer
     comp_path = os.path.join(ctx.results_dir, "informational_compounds.json")
     if os.path.exists(comp_path):
         ctx.add_artifact("informational_compounds.json", "informational-compounds")
 
 
+def _stage_element_roots(ctx: PipelineContext) -> None:
+    """
+    Element root consolidation.
+
+    Groups surface-form elements into root clusters and exports:
+      - element_roots.csv
+      - element_cluster_metrics.json
+    """
+    try:
+        run_element_roots(ctx.results_dir, emit=ctx.emit)
+    except Exception as exc:
+        ctx.log("warn", f"[element_roots] Failed: {exc}")
+        return
+
+    for fname, kind in [
+        ("element_roots.csv", "element-roots"),
+        ("element_cluster_metrics.json", "element-cluster-metrics"),
+    ]:
+        path = os.path.join(ctx.results_dir, fname)
+        if os.path.exists(path):
+            ctx.add_artifact(fname, kind)
+
+
 def _stage_fusion(ctx: PipelineContext) -> None:
     """
-    Span → element fusion and compound context enrichment.
+    Span -> element fusion and compound context enrichment.
 
     Delegates to hilbert_pipeline.run_fusion_pipeline(results_dir, emit).
     """
-    ctx.log("info", "[fusion] Running span→element fusion")
+    ctx.log("info", "[fusion] Running span->element fusion")
     run_fusion_pipeline(ctx.results_dir, emit=ctx.emit)
 
 
@@ -581,7 +637,7 @@ def _stage_compound_stability(ctx: PipelineContext) -> None:
         out_csv = os.path.join(ctx.results_dir, "compound_stability.csv")
 
         if not os.path.exists(compounds_json):
-            ctx.log("warn", "[compound-stability] Missing compounds – skipping")
+            ctx.log("warn", "[compound-stability] Missing compounds - skipping")
             return
 
         compute_compound_stability(
@@ -638,14 +694,13 @@ def _stage_element_labels(ctx: PipelineContext) -> None:
 
 def _stage_signatures(ctx: PipelineContext) -> None:
     """
-    Compute epistemic / misinfo signatures.
+    Compute epistemic and misinfo signatures.
 
     The underlying module is tolerant of missing labels and will no-op gracefully.
     """
     out_path = compute_signatures(ctx.results_dir, emit=ctx.emit)
     if out_path:
         ctx.add_artifact(os.path.basename(out_path), "epistemic-signatures")
-
 
 
 def _stage_element_lm(ctx: PipelineContext) -> None:
@@ -669,9 +724,13 @@ def _stage_element_lm(ctx: PipelineContext) -> None:
 
 def _stage_lm_perplexity(ctx: PipelineContext) -> None:
     """
-    LM perplexity over the corpus using Ollama logprobs.
+    LM perplexity over the corpus.
+
     Produces:
       - lm_metrics.json
+
+    A quick LLM health check is performed at the pipeline level; if the
+    LLM is unavailable, this stage is skipped before it runs.
     """
     try:
         from pathlib import Path
@@ -705,23 +764,36 @@ def _stage_lm_perplexity(ctx: PipelineContext) -> None:
         ctx.log("warn", f"[lm] Perplexity computation failed: {exc}")
 
 
-def _stage_full_export(ctx: PipelineContext) -> None:
+def _stage_final_report(ctx: PipelineContext) -> None:
     """
-    Full export: summary PDF + ZIP bundle.
+    Final scientific report generator.
 
-    Delegates to run_full_export(results_dir, emit).
+    Produces:
+      - hilbert_report.pdf (preferred)
+      - hilbert_report.txt (fallback when ReportLab is unavailable)
     """
-    run_full_export(ctx.results_dir, emit=ctx.emit)
+    run_hilbert_report(ctx.results_dir, emit=ctx.emit)
 
-    for fname, kind in [
-        ("hilbert_summary.pdf", "summary-pdf"),
-        ("hilbert_run.zip", "archive-zip"),
-    ]:
-        path = os.path.join(ctx.results_dir, fname)
-        if os.path.exists(path):
-            ctx.add_artifact(fname, kind)
+    out_pdf = os.path.join(ctx.results_dir, "hilbert_report.pdf")
+    out_txt = os.path.join(ctx.results_dir, "hilbert_report.txt")
+
+    if os.path.exists(out_pdf):
+        ctx.add_artifact("hilbert_report.pdf", "final-report")
+    elif os.path.exists(out_txt):
+        ctx.add_artifact("hilbert_report.txt", "final-report")
+
 
 def _stage_graph_visualizer(ctx: PipelineContext) -> None:
+    """
+    Unified graph engine and snapshot generator.
+
+    Delegates to hilbert_graphs.visualizer.HilbertGraphVisualizer, which
+    is responsible for:
+      - constructing node and edge tables that match the graph contract
+      - writing graph_metadata.json if additional cluster or pruning info
+        becomes available
+      - exporting 2D and 3D snapshots at multiple depths
+    """
     from hilbert_graphs.visualizer import HilbertGraphVisualizer
 
     viz = HilbertGraphVisualizer(
@@ -732,13 +804,24 @@ def _stage_graph_visualizer(ctx: PipelineContext) -> None:
 
     # register only the core artifacts for the frontend
     for fname in [
+        "graph_1pct.png",
+        "graph_5pct.png",
+        "graph_10pct.png",
+        "graph_25pct.png",
+        "graph_50pct.png",
         "graph_full.png",
+        "graph_1pct_3d.png",
+        "graph_5pct_3d.png",
+        "graph_10pct_3d.png",
+        "graph_25pct_3d.png",
+        "graph_50pct_3d.png",
         "graph_full_3d.png",
         "graph_snapshots_index.json",
     ]:
         path = os.path.join(ctx.results_dir, fname)
         if os.path.exists(path):
             ctx.add_artifact(fname, "graph")
+
 
 # -----------------------------------------------------------------------------
 # Declarative stage table - dialectical graph definition
@@ -788,7 +871,19 @@ STAGE_TABLE: List[StageSpec] = [
         depends_on=["edges"],
         consumes=["hilbert_elements.csv", "edges.csv"],
         produces=["molecules.csv", "informational_compounds.json"],
-        supports=["graph_visualizer"],
+        supports=["graph_visualizer", "element_roots"],
+    ),
+    StageSpec(
+        key="element_roots",
+        order=3.5,
+        label="[3.5] Element root consolidation",
+        func=_stage_element_roots,
+        required=False,
+        dialectic_role="structure",
+        depends_on=["molecules"],
+        consumes=["hilbert_elements.csv", "molecules.csv"],
+        produces=["element_roots.csv", "element_cluster_metrics.json"],
+        supports=["stability_metrics", "graph_visualizer"],
     ),
     StageSpec(
         key="stability_metrics",
@@ -867,25 +962,24 @@ STAGE_TABLE: List[StageSpec] = [
     StageSpec(
         key="lm_perplexity",
         order=6.85,
-        label="[6.85] LM Perplexity (Ollama)",
+        label="[6.85] LM Perplexity",
         func=_stage_lm_perplexity,
         required=False,
         dialectic_role="epistemic",
         depends_on=["lsa_field"],
         produces=["lm_metrics.json"],
     ),
-
     # ------------------------------------------------------------------
-    # NEW UNIFIED GRAPH ENGINE
+    # Unified graph engine
     # ------------------------------------------------------------------
     StageSpec(
         key="graph_visualizer",
         order=7.0,
         label="[7] Unified graph visualizer",
-        func=_stage_graph_visualizer,                  # NEW: calls HilbertGraphVisualizer
+        func=_stage_graph_visualizer,
         required=False,
         dialectic_role="visual",
-        depends_on=["molecules"],                      # edges & molecules must exist
+        depends_on=["molecules"],
         consumes=[
             "hilbert_elements.csv",
             "edges.csv",
@@ -907,20 +1001,101 @@ STAGE_TABLE: List[StageSpec] = [
             "graph_snapshots_index.json",
         ],
     ),
-
     StageSpec(
         key="export_all",
         order=8.0,
-        label="[8] Full export (PDF + archive)",
-        func=_stage_full_export,
+        label="[8] Final Hilbert Report",
+        func=_stage_final_report,
         required=False,
         dialectic_role="export",
         depends_on=["element_labels", "compound_stability", "lm_perplexity"],
         supports=["epistemic_signatures"],
-        produces=["hilbert_summary.pdf", "hilbert_run.zip"],
+        produces=["hilbert_report.pdf"],
     ),
 ]
 
+
+# -----------------------------------------------------------------------------
+# Graph metadata writer for the visualisation contract
+# -----------------------------------------------------------------------------
+
+def _write_graph_metadata(ctx: PipelineContext) -> None:
+    """
+    Emit a graph_metadata.json file matching the global metadata part of the
+    graph contract.
+
+    This file is intentionally lightweight and focuses on stable, upstream
+    information. Downstream graph modules may extend or overwrite it with
+    additional fields such as cluster_hierarchy_info or pruning statistics.
+    """
+    meta: Dict[str, Any] = {
+        "version": "1.0",
+        "run_seed": ctx.settings.random_seed,
+        "orchestrator_version": ORCHESTRATOR_VERSION,
+        "lsa_model_version": ctx.extras.get("lsa_model_version", "unknown"),
+        "embedding_parameters": ctx.extras.get("embedding_parameters", None),
+        "cluster_hierarchy_info": ctx.extras.get("cluster_hierarchy_info", None),
+        "pruning": ctx.extras.get("graph_pruning", None),
+    }
+
+    path = os.path.join(ctx.results_dir, "graph_metadata.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        ctx.add_artifact("graph_metadata.json", "graph-metadata")
+    except Exception as exc:
+        ctx.log("warn", f"Failed to write graph_metadata.json: {exc}")
+
+
+# -----------------------------------------------------------------------------
+# LLM health probe (for LM perplexity stage)
+# -----------------------------------------------------------------------------
+
+def _probe_llm(ctx: PipelineContext) -> bool:
+    """
+    Quick sanity check that the external LLM (Ollama / OpenAI-compatible)
+    is reachable and returns a well-formed response.
+
+    This is intentionally lightweight and runs once per pipeline.
+    """
+    # If we already probed in this run, reuse the result
+    if "llm_available" in ctx.extras:
+        return bool(ctx.extras["llm_available"])
+
+    try:
+        # Import the low-level scorer directly
+        from hilbert_pipeline.ollama_lm import score_text_perplexity  # type: ignore
+    except Exception as exc:
+        ctx.log(
+            "warn",
+            "[lm] ollama_lm module not available; skipping LM-based metrics",
+            error=str(exc),
+        )
+        ctx.extras["llm_available"] = False
+        return False
+
+    try:
+        res = score_text_perplexity("Hilbert LM health check.", model=None)
+    except Exception as exc:
+        ctx.log(
+            "warn",
+            "[lm] LLM health check failed; skipping LM-based metrics",
+            error=str(exc),
+        )
+        ctx.extras["llm_available"] = False
+        return False
+
+    if not isinstance(res, dict) or "perplexity" not in res:
+        ctx.log(
+            "warn",
+            "[lm] LLM health check returned unexpected payload; skipping LM-based metrics",
+        )
+        ctx.extras["llm_available"] = False
+        return False
+
+    ctx.log("info", "[lm] LLM health check ok", model=res.get("model"))
+    ctx.extras["llm_available"] = True
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -946,6 +1121,13 @@ def run_pipeline(
     settings = settings or PipelineSettings()
     emit = emit or DEFAULT_EMIT
 
+    # Ensure deterministic random behaviour for upstream modules
+    try:
+        random.seed(settings.random_seed)
+        np.random.seed(settings.random_seed)
+    except Exception:
+        pass
+
     _ensure_dir(results_dir)
     ctx = PipelineContext(
         corpus_dir=os.path.abspath(corpus_dir),
@@ -955,6 +1137,14 @@ def run_pipeline(
     )
 
     ctx.log("info", "Starting Hilbert pipeline run", corpus=ctx.corpus_dir)
+
+    # Probe LLM availability once for this run; used to decide whether to
+    # execute the LM perplexity stage.
+    try:
+        ctx.extras["llm_available"] = _probe_llm(ctx)
+    except Exception as exc:
+        ctx.log("warn", f"[lm] LLM probe failed: {exc}")
+        ctx.extras["llm_available"] = False
 
     for spec in sorted(STAGE_TABLE, key=lambda s: s.order):
         # Check hard dependencies
@@ -972,6 +1162,14 @@ def run_pipeline(
             else:
                 ctx.end_stage_skipped(spec, reason=reason)
                 continue
+
+        # Conditional skip for LM-based perplexity if LLM is down
+        if spec.key == "lm_perplexity" and not ctx.extras.get("llm_available", False):
+            ctx.end_stage_skipped(
+                spec,
+                reason="LLM unavailable - skipping LM perplexity stage",
+            )
+            continue
 
         # Conceptual node only
         if spec.func is None:
@@ -991,6 +1189,10 @@ def run_pipeline(
                     stage=spec.key,
                 )
                 break
+
+    # Write graph-level metadata snapshot based on whatever upstream info
+    # we managed to collect during this run.
+    _write_graph_metadata(ctx)
 
     summary = ctx.run_summary(STAGE_TABLE)
 

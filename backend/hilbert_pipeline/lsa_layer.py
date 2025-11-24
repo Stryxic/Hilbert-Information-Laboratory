@@ -1,5 +1,5 @@
 # =============================================================================
-# lsa_layer.py — Hilbert Information Chemistry Lab
+# lsa_layer.py - Hilbert Information Chemistry Lab
 # Latent Semantic Analysis + Element Extraction Layer
 # =============================================================================
 # Version: 2025 Thesis-Aligned Pipeline (Multi-format, upgraded)
@@ -8,7 +8,7 @@
 #   - Ingest heterogeneous corpus files (PDF, LaTeX, code, plain text, HTML)
 #   - Apply format-aware preprocessing to recover natural language spans
 #   - Extract noun-like "elements" from spans via spaCy (with safe fallbacks)
-#   - Build a TF–IDF term–span matrix over elements
+#   - Build a TF-IDF term-span matrix over elements
 #   - Compute an LSA (truncated SVD) spectral field
 #   - Emit a compact JSON-serialisable representation for downstream stages
 #
@@ -24,6 +24,10 @@
 #                              "index": int,
 #                              "collection_freq": int,
 #                              "document_freq": int,
+#                              "tf": float,          # alias for collection_freq
+#                              "df": float,          # alias for document_freq
+#                              "idf": float,
+#                              "tfidf": float,
 #                              "entropy": float,
 #                              "coherence": float,
 #                            } ],
@@ -39,6 +43,17 @@
 #                           } ],
 #           "vocab":       [ str, ... ],
 #           "H_span":      [ float, ... ]   # optional per-span entropy
+#       },
+#       "config": {
+#           "version": str,
+#           "model": "svd",
+#           "model_version": str,
+#           "n_components": int,
+#           "max_vocab": int,
+#           "normalisation": "l2",
+#           "embedding_parameters": { ... },
+#           "n_spans": int,
+#           "n_terms": int,
 #       }
 #   }
 # =============================================================================
@@ -62,7 +77,7 @@ except Exception as e:  # pragma: no cover
         "(TfidfVectorizer, TruncatedSVD)."
     ) from e
 
-# spaCy is optional – we degrade gracefully if unavailable
+# spaCy is optional - we degrade gracefully if unavailable
 try:
     import spacy  # type: ignore
 
@@ -593,11 +608,16 @@ def compute_lsa_embeddings(
     Returns
     -------
     embeddings : np.ndarray
-        Matrix of shape (n_spans, n_components).
+        Matrix of shape (n_spans, n_components_effective).
     vocab : list of str
         Vocabulary of extracted elements (can include spaces).
     vectorizer : fitted TfidfVectorizer
         Returned so that caller can inspect IDF / feature names if needed.
+
+    Notes
+    -----
+    Randomness is controlled via a fixed random_state=42 so that the
+    embeddings are reproducible for a given corpus.
     """
     if not spans:
         return np.zeros((0, 0), dtype=float), [], None
@@ -606,10 +626,7 @@ def compute_lsa_embeddings(
     # here each span is treated as a document.
     n_docs = len(spans)
 
-    # Choose min_df / max_df as *absolute counts* and ensure consistency.
-    # - For a single-span corpus we must allow terms that occur in that span.
-    # - For larger corpora we keep a light filter but always enforce
-    #   max_df >= min_df so scikit-learn never raises.
+    # Choose min_df / max_df as absolute counts and ensure consistency.
     if n_docs <= 1:
         min_df = 1
         max_df = 1
@@ -617,7 +634,7 @@ def compute_lsa_embeddings(
         # keep terms that appear in at least 2 spans,
         # and do not drop anything by upper frequency
         min_df = 2
-        max_df = n_docs  # absolute doc count, always >= min_df
+        max_df = n_docs
 
     vectorizer = TfidfVectorizer(
         tokenizer=extract_elements_from_text,
@@ -636,9 +653,9 @@ def compute_lsa_embeddings(
         return np.zeros((0, 0), dtype=float), [], vectorizer
 
     # Do not ask for more components than min(n_docs, vocab_size) - 1
-    n_components = min(n_components, max(2, min(X.shape) - 1))
+    n_components_effective = min(n_components, max(2, min(X.shape) - 1))
 
-    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    svd = TruncatedSVD(n_components=n_components_effective, random_state=42)
     embeddings = svd.fit_transform(X)
 
     return embeddings.astype(float), vocab, vectorizer
@@ -674,6 +691,10 @@ def run_lsa_layer(
                                "index": idx,
                                "collection_freq": cf,
                                "document_freq": df,
+                               "tf": float,
+                               "df": float,
+                               "idf": float,
+                               "tfidf": float,
                                "entropy": float,
                                "coherence": float,
                              } ],
@@ -685,14 +706,15 @@ def run_lsa_layer(
                                 "text": str, "elements": [str, ...] },
                               ...
                            ],
-        "span_entropy":    [ float, ... ]  # per-span entropy (optional)
+        "span_entropy":    [ float, ... ],  # per-span entropy
+        "config":          { ... }          # embedding parameters and metadata
       }
     """
     corpus_dir = Path(corpus_dir)
     if not corpus_dir.exists():
         raise FileNotFoundError(f"Corpus directory does not exist: {corpus_dir}")
 
-    # Collect candidate files – accept a variety of file types, recursively
+    # Collect candidate files - accept a variety of file types, recursively
     files = sorted(p for p in corpus_dir.rglob("*") if p.is_file())
 
     spans: List[str] = []
@@ -770,6 +792,22 @@ def run_lsa_layer(
             "embeddings": np.zeros((0, 0), dtype=float),
             "span_map": [],
             "span_entropy": [],
+            "config": {
+                "version": "hilbert-lsa-2025",
+                "model": "svd",
+                "model_version": "svd-0-l2",
+                "n_components": 0,
+                "max_vocab": max_vocab,
+                "normalisation": "l2",
+                "embedding_parameters": {
+                    "model": "svd",
+                    "n_components": 0,
+                    "max_vocab": max_vocab,
+                    "random_state": 42,
+                },
+                "n_spans": 0,
+                "n_terms": 0,
+            },
         }
 
     # LSA: embeddings + vocab + vectorizer
@@ -784,12 +822,14 @@ def run_lsa_layer(
     #   - element entropy (over spans)
     #   - element coherence (via centroid similarity in embedding space)
     #   - span entropy (over vocabulary)
+    #   - idf and aggregate tfidf per element
     # -------------------------------------------------------------------------
     if vectorizer is not None:
         X = vectorizer.transform(spans)  # (n_spans, n_terms)
+        idf_array = getattr(vectorizer, "idf_", None)
     else:
-        # Very defensive fallback
         X = None
+        idf_array = None
 
     n_spans = len(spans)
     n_terms = len(vocab)
@@ -815,7 +855,7 @@ def run_lsa_layer(
     # Build element registry from vocab
     element_to_index: Dict[str, int] = {e: i for i, e in enumerate(vocab)}
 
-    # Collection frequency and document frequency
+    # Collection frequency and document frequency from span_map
     cf_counter: Counter[str] = Counter()
     df_counter: Counter[str] = Counter()
 
@@ -831,48 +871,59 @@ def run_lsa_layer(
             df_counter[e] += 1
 
     # -------------------------------------------------------------------------
-    # Element-level entropy & coherence
+    # Element-level entropy, coherence, idf and aggregate tfidf
     # -------------------------------------------------------------------------
-    # entropy(e): distribution of e across spans using TF–IDF magnitudes
-    # coherence(e): how tightly clustered the spans of e are in LSA space
     element_entropy: Dict[str, float] = {}
     element_coherence: Dict[str, float] = {}
+    element_idf: Dict[str, float] = {}
+    element_tfidf: Dict[str, float] = {}
 
     if X is not None and embeddings is not None and embeddings.size > 0:
         emb_arr = np.asarray(embeddings, dtype=float)
+
         for term_idx, term in enumerate(vocab):
             col = X[:, term_idx].toarray().ravel()
             total = float(col.sum())
             if total <= 0.0:
                 element_entropy[term] = 0.0
                 element_coherence[term] = 0.0
-                continue
+                element_tfidf[term] = 0.0
+            else:
+                # entropy over spans
+                p = col / total
+                mask = p > 0
+                p_masked = p[mask]
+                H_e = -float(np.sum(p_masked * np.log(p_masked)))
+                element_entropy[term] = H_e
+                element_tfidf[term] = total
 
-            # entropy over spans
-            p = col / total
-            mask = p > 0
-            p_masked = p[mask]
-            H_e = -float(np.sum(p_masked * np.log(p_masked)))
-            element_entropy[term] = H_e
+                # coherence via centroid similarity in embedding space
+                span_idxs = np.where(col > 0)[0]
+                if span_idxs.size <= 1:
+                    element_coherence[term] = 0.0
+                else:
+                    vecs = emb_arr[span_idxs, :]  # (m, k)
+                    centroid = vecs.mean(axis=0)
+                    # normalise for cosine similarity
+                    vecs_norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
+                    centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
+                    sims = np.dot(vecs_norm, centroid_norm)
+                    element_coherence[term] = float(np.mean(sims))
 
-            # coherence via centroid similarity in embedding space
-            span_idxs = np.where(col > 0)[0]
-            if span_idxs.size <= 1:
-                element_coherence[term] = 0.0
-                continue
-
-            vecs = emb_arr[span_idxs, :]  # (m, k)
-            centroid = vecs.mean(axis=0)
-            # normalise for cosine similarity
-            vecs_norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
-            centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
-            sims = np.dot(vecs_norm, centroid_norm)
-            element_coherence[term] = float(np.mean(sims))
+            # idf
+            if idf_array is not None and len(idf_array) == n_terms:
+                element_idf[term] = float(idf_array[term_idx])
+            else:
+                # simple log based on df
+                df = df_counter.get(term, 0)
+                element_idf[term] = float(np.log((n_spans + 1) / (df + 1)) + 1.0)
     else:
         # conservative fallback if we somehow lack X or embeddings
         for term in vocab:
             element_entropy[term] = 0.0
             element_coherence[term] = 0.0
+            element_idf[term] = 0.0
+            element_tfidf[term] = 0.0
 
     # -------------------------------------------------------------------------
     # Assemble element registry + metrics
@@ -885,17 +936,49 @@ def run_lsa_layer(
         df = int(df_counter.get(e, 0))
         H_e = float(element_entropy.get(e, 0.0))
         C_e = float(element_coherence.get(e, 0.0))
+        idf_val = float(element_idf.get(e, 0.0))
+        tfidf_val = float(element_tfidf.get(e, 0.0))
+
         elements.append({"element": e, "index": idx})
         element_metrics.append(
             {
                 "element": e,
                 "index": idx,
+                # original names kept for backward compatibility
                 "collection_freq": cf,
                 "document_freq": df,
+                # aliases for graph and analytics layers
+                "tf": float(cf),
+                "df": float(df),
+                "idf": idf_val,
+                "tfidf": tfidf_val,
                 "entropy": H_e,
                 "coherence": C_e,
             }
         )
+
+    # -------------------------------------------------------------------------
+    # Build configuration block for orchestrator and graph metadata
+    # -------------------------------------------------------------------------
+    n_components_effective = int(embeddings.shape[1]) if isinstance(embeddings, np.ndarray) else 0
+    model_version = f"svd-{n_components_effective or n_components}-l2"
+
+    config: Dict[str, Any] = {
+        "version": "hilbert-lsa-2025",
+        "model": "svd",
+        "model_version": model_version,
+        "n_components": n_components_effective or n_components,
+        "max_vocab": max_vocab,
+        "normalisation": "l2",
+        "embedding_parameters": {
+            "model": "svd",
+            "n_components": n_components_effective or n_components,
+            "max_vocab": max_vocab,
+            "random_state": 42,
+        },
+        "n_spans": n_spans,
+        "n_terms": n_terms,
+    }
 
     return {
         "elements": elements,
@@ -904,6 +987,7 @@ def run_lsa_layer(
         "embeddings": embeddings,
         "span_map": span_map,
         "span_entropy": H_span,
+        "config": config,
     }
 
 
@@ -932,7 +1016,8 @@ def build_lsa_field(
                 "span_map": [...],
                 "vocab": [...],
                 "H_span": [...],  # optional per-span entropy
-            }
+            },
+            "config": { ... }   # embedding parameters and LSA metadata
         }
     """
     emit("log", {"stage": "lsa", "event": "start"})
@@ -949,6 +1034,7 @@ def build_lsa_field(
     embeddings = res.get("embeddings")
     vocab = res.get("vocab", []) or []
     H_span = res.get("span_entropy")
+    config = res.get("config", {})
 
     field: Dict[str, Any] = {
         "embeddings": embeddings,
@@ -962,6 +1048,7 @@ def build_lsa_field(
         "elements": elements,
         "element_metrics": metrics,
         "field": field,
+        "config": config,
     }
 
     emit("log", {"stage": "lsa", "event": "end"})

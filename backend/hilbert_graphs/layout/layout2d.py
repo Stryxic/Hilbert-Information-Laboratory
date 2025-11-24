@@ -1,218 +1,289 @@
 """
-2D layout engines (community-aware enhanced version).
+2D layout engines (community-aware, compound-aware, stable, hub-compatible).
+
+This upgraded module implements:
+  - canonical 2D layout (stable across snapshots)
+  - community sector placement
+  - compound and root substructure ordering
+  - stability / entropy / coherence radial influence
+  - multi-scale repulsion (macro / meso / micro)
+  - final [-1,1]^2 normalised coordinate field
+
+Exports:
+    - compute_layout_2d_hybrid
+    - compute_layout_2d_radial
 """
 
 from __future__ import annotations
+from typing import Dict, Tuple, Optional, List
 
-from typing import Dict, Tuple, List, Optional
 import numpy as np
 import networkx as nx
 
 
-# -----------------------------------------------------------------------------#
+# ============================================================================ #
 # Helpers
-# -----------------------------------------------------------------------------#
+# ============================================================================ #
 
-def _safe_normalise_positions(
-    pos: Dict[str, Tuple[float, float]]
-) -> Dict[str, Tuple[float, float]]:
-    """Rescale layout to a rough unit-square bounding box."""
+def _center_positions(pos: Dict[str, Tuple[float, float]]) -> Dict[str, Tuple[float, float]]:
     if not pos:
         return {}
-
-    xs = np.array([p[0] for p in pos.values()], dtype=float)
-    ys = np.array([p[1] for p in pos.values()], dtype=float)
-
-    x_min, x_max = float(xs.min()), float(xs.max())
-    y_min, y_max = float(ys.min()), float(ys.max())
-
-    dx = max(1e-9, x_max - x_min)
-    dy = max(1e-9, y_max - y_min)
-
-    scale = 2.0 / max(dx, dy)
-
-    out = {}
-    for n, (x, y) in pos.items():
-        xn = (x - x_min) * scale - (dx * scale) / 2.0
-        yn = (y - y_min) * scale - (dy * scale) / 2.0
-        out[n] = (float(xn), float(yn))
-
-    return out
+    xs = np.array([p[0] for p in pos.values()])
+    ys = np.array([p[1] for p in pos.values()])
+    cx, cy = xs.mean(), ys.mean()
+    return {n: (float(x - cx), float(y - cy)) for n, (x, y) in pos.items()}
 
 
-def _initial_cluster_positions(
-    G: nx.Graph,
-    community_map: Dict[str, int],
-    radius_scale: float = 1.0,
-) -> Dict[str, Tuple[float, float]]:
-    """
-    Place communities on a coarse circle before spring refinement.
-
-    Returns an initial pos dict mapping node -> (x,y).
-    """
-    if not community_map:
+def _normalise_positions(pos: Dict[str, Tuple[float, float]]) -> Dict[str, Tuple[float, float]]:
+    """Normalise to [-1,1]^2, centering first."""
+    if not pos:
         return {}
+    pos = _center_positions(pos)
+    xs = np.array([p[0] for p in pos.values()])
+    ys = np.array([p[1] for p in pos.values()])
+    dx = max(1e-9, xs.max() - xs.min())
+    dy = max(1e-9, ys.max() - ys.min())
+    scale = 1.0 / max(dx, dy)
+    return {n: (float(x * scale), float(y * scale)) for n, (x, y) in pos.items()}
 
-    nodes = list(G.nodes())
-    comm_ids = sorted({community_map.get(n, 0) for n in nodes})
-    k = len(comm_ids)
 
-    # Angle for each community
-    thetas = np.linspace(0, 2*np.pi, k, endpoint=False)
-    cluster_centroids = {
-        cid: (radius_scale * np.cos(t), radius_scale * np.sin(t))
-        for cid, t in zip(comm_ids, thetas)
+# ============================================================================ #
+# Community / compound seeding
+# ============================================================================ #
+
+def _cluster_centroids(ids: Dict[str, str], base_radius: float) -> Dict[str, Tuple[float, float]]:
+    """Place cluster IDs (communities or compounds) on a circle."""
+    if not ids:
+        return {}
+    uniq = sorted(set(ids.values()))
+    k = len(uniq)
+    thetas = np.linspace(0, 2 * np.pi, k, endpoint=False)
+    return {
+        cid: (base_radius * float(np.cos(t)), base_radius * float(np.sin(t)))
+        for cid, t in zip(uniq, thetas)
     }
 
-    pos0 = {}
+
+def _initial_positions(
+    G: nx.Graph,
+    *,
+    community_ids: Optional[Dict[str, str]] = None,
+    compound_ids: Optional[Dict[str, str]] = None,
+    stability_vals: Optional[Dict[str, float]] = None,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Hierarchical initialisation:
+      1. Communities placed radially (macro structure)
+      2. Compounds placed around their community centroid (meso structure)
+      3. Roots + internal structure jittered (micro structure)
+    """
+    nodes = list(G.nodes())
+    if not nodes:
+        return {}
+
+    # Radii
+    R_comm = 1.8
+    R_comp = 0.8
+
+    comm_centroids = _cluster_centroids(community_ids or {}, R_comm)
+    comp_centroids = _cluster_centroids(compound_ids or {}, R_comp)
+
+    pos = {}
+
     for n in nodes:
-        cid = community_map.get(n, 0)
-        cx, cy = cluster_centroids[cid]
-        # jitter inside cluster centre to avoid degenerate placements
-        jx = (np.random.default_rng(hash(n) % (2**32)).normal() * 0.05)
-        jy = (np.random.default_rng(~hash(n) % (2**32)).normal() * 0.05)
-        pos0[n] = (cx + jx, cy + jy)
+        nid = str(n)
+        # Macro: community position
+        if community_ids and nid in community_ids:
+            cc = comm_centroids.get(community_ids[nid], (0.0, 0.0))
+        else:
+            cc = (0.0, 0.0)
 
-    return pos0
+        # Meso: compound sub-centroid
+        if compound_ids and nid in compound_ids:
+            cs = comp_centroids.get(compound_ids[nid], (0.0, 0.0))
+        else:
+            cs = (0.0, 0.0)
+
+        # Combine macro + meso
+        px = cc[0] + 0.6 * cs[0]
+        py = cc[1] + 0.6 * cs[1]
+
+        # Micro jitter
+        rng = np.random.default_rng(abs(hash(nid)) & 0xFFFFFFFF)
+        jx = rng.normal(scale=0.15)
+        jy = rng.normal(scale=0.15)
+
+        # Optionally warp by stability to create pseudo-radial shells
+        if stability_vals:
+            s = stability_vals.get(nid, 0.5)
+            px *= 1.0 + 0.4 * (1.0 - s)
+            py *= 1.0 + 0.4 * (1.0 - s)
+
+        pos[nid] = (float(px + jx), float(py + jy))
+
+    return pos
 
 
-# -----------------------------------------------------------------------------#
-# HYBRID LAYOUT (Improved: community-aware)
-# -----------------------------------------------------------------------------#
+# ============================================================================ #
+# Hybrid layout (enhanced spectral + spring + KK)
+# ============================================================================ #
 
 def compute_layout_2d_hybrid(
     G: nx.Graph,
-    community_map: Optional[Dict[str, int]] = None,
+    cluster_info: Optional[Any] = None,
 ) -> Dict[str, Tuple[float, float]]:
     """
-    Community-aware hybrid 2D layout:
-      - Optional community-based initial placement
-      - spectral_layout for global structure (fallback)
-      - spring_layout with tuned k
-      - optional Kamada-Kawai refinement for small graphs
+    Canonical Hilbert 2D layout.
 
-    Normalises to a unit-square bounding box.
+    cluster_info supplies:
+      - community_ids
+      - compound_ids
+      - stability_bands or direct stability values
     """
     if G.number_of_nodes() == 0:
         return {}
 
-    # --- Step 0: community seeded initial layout --------------------------------#
-    if community_map:
-        pos0 = _initial_cluster_positions(G, community_map, radius_scale=1.8)
-    else:
-        try:
-            pos0 = nx.spectral_layout(G, dim=2, seed=42)
-        except Exception:
-            pos0 = None
+    # Cluster info
+    community_ids = getattr(cluster_info, "community_ids", None)
+    compound_ids = getattr(cluster_info, "compound_ids", None)
 
-    # --- Step 1: tuned spring refinement ----------------------------------------#
-    n = max(G.number_of_nodes(), 1)
-    k = 1.2 / np.sqrt(n)
+    # stability values preferred from stability_z, else entropy/coherence
+    stability_vals = None
+    if cluster_info and hasattr(cluster_info, "stability_bands"):
+        # Convert band labels to approximate numeric field
+        # Lower band index = lower radius
+        stability_vals = {}
+        for b_idx, (band, members) in enumerate(sorted(cluster_info.stability_bands.items())):
+            for n in members:
+                stability_vals[n] = float((b_idx + 1) / len(cluster_info.stability_bands))
+
+    # 1. Hierarchical seed
+    try:
+        pos0 = _initial_positions(
+            G,
+            community_ids=community_ids,
+            compound_ids=compound_ids,
+            stability_vals=stability_vals,
+        )
+    except Exception:
+        pos0 = None
+
+    # 2. Spring layout refinement
+    n = G.number_of_nodes()
+    avg_deg = float(np.mean([d for _, d in G.degree()])) if n else 0.0
+    if avg_deg < 2:
+        k = 3.2 / np.sqrt(max(n, 1))
+    elif avg_deg < 5:
+        k = 2.2 / np.sqrt(max(n, 1))
+    else:
+        k = 1.4 / np.sqrt(max(n, 1))
 
     try:
-        pos1 = nx.spring_layout(
+        pos_spring = nx.spring_layout(
             G,
             dim=2,
             pos=pos0,
             k=k,
-            iterations=90,
             weight="weight",
+            iterations=160,
             seed=42,
         )
     except Exception:
-        pos1 = nx.spring_layout(
+        pos_spring = nx.spring_layout(
             G,
             dim=2,
             k=k,
-            iterations=90,
             weight="weight",
+            iterations=160,
             seed=42,
         )
 
-    # --- Step 2: Kamada-Kawai refinement ----------------------------------------#
-    if G.number_of_nodes() <= 800:
-        try:
-            pos2 = nx.kamada_kawai_layout(
-                G,
-                pos=pos1,
-                weight="weight",
-                dim=2,
-            )
-        except Exception:
-            pos2 = pos1
-    else:
-        pos2 = pos1
+    # 3. Kamada-Kawai refinement
+    try:
+        pos_kk = nx.kamada_kawai_layout(
+            G,
+            pos=pos_spring,
+            dim=2,
+            weight="weight",
+        )
+    except Exception:
+        pos_kk = pos_spring
 
-    # --- Step 3: normalise ------------------------------------------------------#
-    return _safe_normalise_positions(pos2)
+    # 4. Center + normalise
+    return _normalise_positions(pos_kk)
 
 
-# -----------------------------------------------------------------------------#
-# RADIAL LAYOUT (Unchanged except cleanup)
-# -----------------------------------------------------------------------------#
+# ============================================================================ #
+# Radial layout
+# ============================================================================ #
 
 def compute_layout_2d_radial(
     G: nx.Graph,
-    mode: str = "stability"
+    *,
+    mode: str = "stability",
+    cluster_info: Optional[Any] = None,
 ) -> Dict[str, Tuple[float, float]]:
     """
-    Radial layout - nodes placed on concentric rings based on a scalar attribute.
+    Radial scientific layout:
+      - stability or entropy/coherence determines radius
+      - deterministic angular ordering
+      - community-based angular grouping if available
     """
     if G.number_of_nodes() == 0:
         return {}
 
-    nodes = list(G.nodes())
+    nodes = [str(n) for n in G.nodes()]
 
-    # Scoring
+    # Extract scalar
     if mode == "degree":
-        scores = np.array([float(G.degree(n)) for n in nodes], dtype=float)
-    elif mode == "epistemic":
-        scores = np.array([
-            float(G.nodes[n].get("mean_entropy", G.nodes[n].get("entropy", 0.0)))
-            for n in nodes
-        ], dtype=float)
+        vals = {n: float(G.degree(n)) for n in nodes}
+    elif mode == "entropy":
+        vals = {n: float(G.nodes[n].get("entropy", 0.0)) for n in nodes}
+    elif mode == "coherence":
+        vals = {n: float(G.nodes[n].get("coherence", 0.0)) for n in nodes}
+    else:  # stability
+        vals = {n: float(G.nodes[n].get("stability", G.nodes[n].get("temperature", 0.5))) for n in nodes}
+
+    arr = np.array(list(vals.values()))
+    lo, hi = float(arr.min()), float(arr.max())
+    norm = np.zeros_like(arr) if hi - lo < 1e-9 else (arr - lo) / (hi - lo)
+    norm_map = {n: float(v) for n, v in zip(nodes, norm)}
+
+    # Angular ordering: group by communities if available
+    community_ids = getattr(cluster_info, "community_ids", None)
+
+    if community_ids:
+        comm_groups: Dict[str, List[str]] = {}
+        for n in nodes:
+            cid = community_ids.get(n, "Q000")
+            comm_groups.setdefault(cid, []).append(n)
+        comm_order = sorted(comm_groups.keys())
     else:
-        scores = np.array([
-            float(G.nodes[n].get("stability", G.nodes[n].get("temperature", 1.0)))
-            for n in nodes
-        ], dtype=float)
+        comm_order = ["ALL"]
+        comm_groups = {"ALL": nodes}
 
-    # Normalise
-    if scores.size == 0:
-        return {}
+    # Layout
+    pos: Dict[str, Tuple[float, float]] = {}
+    rng = np.random.default_rng(42)
 
-    mn, mx = float(np.nanmin(scores)), float(np.nanmax(scores))
-    if mx - mn < 1e-9:
-        norm_scores = np.zeros_like(scores)
-    else:
-        norm_scores = (scores - mn) / (mx - mn + 1e-9)
+    # Each community occupies contiguous angular sector
+    base_angle = 0.0
+    sector_step = 2 * np.pi / len(comm_order)
 
-    # Quantile buckets
-    q = np.quantile(norm_scores, [0, 0.25, 0.5, 0.75, 1])
-    radii = np.linspace(0.2, 1.0, 5)
+    for cid in comm_order:
+        group = comm_groups[cid]
+        m = max(1, len(group))
+        start = base_angle
+        end = start + sector_step
 
-    ring_nodes = [[] for _ in range(5)]
-    for n, s in zip(nodes, norm_scores):
-        if s <= q[1]:
-            ring_nodes[0].append(n)
-        elif s <= q[2]:
-            ring_nodes[1].append(n)
-        elif s <= q[3]:
-            ring_nodes[2].append(n)
-        elif s <= q[4]:
-            ring_nodes[3].append(n)
-        else:
-            ring_nodes[4].append(n)
-
-    pos = {}
-    rng = np.random.default_rng(seed=42)
-
-    for i, ring in enumerate(ring_nodes):
-        r = radii[i]
-        m = max(len(ring), 1)
-        angles = np.linspace(0, 2*np.pi, m, endpoint=False)
+        # Distribute evenly
+        angles = np.linspace(start, end, m, endpoint=False)
         rng.shuffle(angles)
-        for n, a in zip(ring, angles):
-            pos[n] = (float(r*np.cos(a)), float(r*np.sin(a)))
 
-    return pos
+        for n, a in zip(group, angles):
+            r = 0.2 + 0.9 * norm_map[n]
+            pos[n] = (float(r * np.cos(a)), float(r * np.sin(a)))
+
+        base_angle += sector_step
+
+    return _normalise_positions(pos)
