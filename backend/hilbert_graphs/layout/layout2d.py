@@ -15,7 +15,7 @@ Exports:
 """
 
 from __future__ import annotations
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any  # <- added Any
 
 import numpy as np
 import networkx as nx
@@ -88,7 +88,7 @@ def _initial_positions(
     comm_centroids = _cluster_centroids(community_ids or {}, R_comm)
     comp_centroids = _cluster_centroids(compound_ids or {}, R_comp)
 
-    pos = {}
+    pos: Dict[str, Tuple[float, float]] = {}
 
     for n in nodes:
         nid = str(n)
@@ -138,7 +138,7 @@ def compute_layout_2d_hybrid(
     cluster_info supplies:
       - community_ids
       - compound_ids
-      - stability_bands or direct stability values
+      - (optionally) stability_bands: Dict[str, List[str]]
     """
     if G.number_of_nodes() == 0:
         return {}
@@ -147,15 +147,18 @@ def compute_layout_2d_hybrid(
     community_ids = getattr(cluster_info, "community_ids", None)
     compound_ids = getattr(cluster_info, "compound_ids", None)
 
-    # stability values preferred from stability_z, else entropy/coherence
-    stability_vals = None
-    if cluster_info and hasattr(cluster_info, "stability_bands"):
-        # Convert band labels to approximate numeric field
-        # Lower band index = lower radius
+    # Stability values preferred from cluster_info.stability_bands if present.
+    # Current ClusterInfo does not have this field yet, so this usually
+    # stays None and the code falls back to pure cluster seeding.
+    stability_vals: Optional[Dict[str, float]] = None
+    if cluster_info is not None and hasattr(cluster_info, "stability_bands"):
         stability_vals = {}
-        for b_idx, (band, members) in enumerate(sorted(cluster_info.stability_bands.items())):
+        bands = getattr(cluster_info, "stability_bands", {})
+        n_bands = max(len(bands), 1)
+        for b_idx, (band, members) in enumerate(sorted(bands.items())):
+            val = float((b_idx + 1) / n_bands)
             for n in members:
-                stability_vals[n] = float((b_idx + 1) / len(cluster_info.stability_bands))
+                stability_vals[str(n)] = val
 
     # 1. Hierarchical seed
     try:
@@ -242,7 +245,15 @@ def compute_layout_2d_radial(
     elif mode == "coherence":
         vals = {n: float(G.nodes[n].get("coherence", 0.0)) for n in nodes}
     else:  # stability
-        vals = {n: float(G.nodes[n].get("stability", G.nodes[n].get("temperature", 0.5))) for n in nodes}
+        vals = {
+            n: float(
+                G.nodes[n].get(
+                    "stability",
+                    G.nodes[n].get("temperature", 0.5),
+                )
+            )
+            for n in nodes
+        }
 
     arr = np.array(list(vals.values()))
     lo, hi = float(arr.min()), float(arr.max())
@@ -256,7 +267,7 @@ def compute_layout_2d_radial(
         comm_groups: Dict[str, List[str]] = {}
         for n in nodes:
             cid = community_ids.get(n, "Q000")
-            comm_groups.setdefault(cid, []).append(n)
+            comm_groups.setdefault(str(cid), []).append(n)
         comm_order = sorted(comm_groups.keys())
     else:
         comm_order = ["ALL"]
@@ -276,7 +287,7 @@ def compute_layout_2d_radial(
         start = base_angle
         end = start + sector_step
 
-        # Distribute evenly
+        # Distribute evenly within this sector with small randomisation
         angles = np.linspace(start, end, m, endpoint=False)
         rng.shuffle(angles)
 

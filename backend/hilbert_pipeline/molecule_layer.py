@@ -1,30 +1,35 @@
 # =============================================================================
-# hilbert_pipeline/molecule_layer.py — Molecular Field & Compound Builder (v2)
+# hilbert_pipeline/molecule_layer.py — Molecular Field & Compound Builder (v3)
 # =============================================================================
 """
-Constructs informational molecules and compounds from the word-level graph.
+Construct informational molecules and compounds from the element-level graph.
 
-This layer is responsible for:
-  - Turning hilbert_elements.csv + edges.csv into molecular structures
-  - Computing per-element thermodynamic signals:
-        local_stability, entropy, coherence, temperature
-  - Aggregating elements → molecules → compounds
-  - Exporting informational_compounds.json
+Responsibilities:
+  - Turn hilbert_elements.csv + edges.csv into molecular structures.
+  - Compute per-element thermodynamic signals:
+        local_stability, entropy, coherence, temperature.
+  - Aggregate elements → molecules → compounds.
+  - Export informational_compounds.json.
+  - Provide molecule_df and compound_df to the orchestrator.
 
-This version integrates:
-  - orchestrator event streaming (emit)
-  - NaN-safe stats
-  - Robust connected-component discovery
-  - Regime-aware compound profiling
-  - Temperature modelling (entropy - coherence)
-  - Protection against degenerate / empty graphs
+Pipeline 3.1 alignment:
+  - Respects upgraded edges.csv schema:
+        source, target, weight, scaled_weight, confidence, polarity,
+        is_backbone, source_id, target_id.
+  - Respects upgraded hilbert_elements.csv schema:
+        element, element_id (or index), entropy, coherence, tf, df, idf, tfidf.
+  - Molecule table exposes element_id and compound_id for graph-layer joins.
+
+Backward compatibility:
+  - Older hilbert_elements.csv files with only element + entropy/coherence
+    still work.
+  - Older edges.csv files with only source, target, weight still work.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
@@ -44,7 +49,7 @@ def _log(
     msg: str,
     **fields: Any,
 ) -> None:
-    """Pipeline-compatible logger with fallback to print."""
+    """Pipeline compatible logger with fallback to print."""
     payload = {"level": level, "msg": msg}
     payload.update(fields)
     try:
@@ -62,7 +67,9 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def _load_df(path: str, cols: List[str], emit=DEFAULT_EMIT) -> pd.DataFrame:
-    """Load CSV and ensure required columns exist (filling with NaNs if missing)."""
+    """
+    Load CSV and ensure required columns exist (filled with NaN if missing).
+    """
     if not os.path.exists(path):
         _log(emit, "warn", "[molecule] Missing file", path=path)
         return pd.DataFrame(columns=cols)
@@ -88,15 +95,30 @@ def _load_elements(elements_csv: str, emit=DEFAULT_EMIT) -> pd.DataFrame:
     """
     Load element table and normalise entropy / coherence field names.
 
-    Ensures:
+    Ensures at least:
       - element (str)
-      - token (str)
+      - element_id (int, stable)  [generated from index if missing]
       - mean_entropy
       - mean_coherence
+
+    Also keeps tf, df, tfidf, idf when available for downstream analytics.
     """
     df = _load_df(
         elements_csv,
-        ["element", "token", "mean_entropy", "mean_coherence", "entropy", "coherence"],
+        [
+            "element",
+            "token",
+            "mean_entropy",
+            "mean_coherence",
+            "entropy",
+            "coherence",
+            "element_id",
+            "index",
+            "tf",
+            "df",
+            "idf",
+            "tfidf",
+        ],
         emit,
     )
     if df.empty:
@@ -105,24 +127,46 @@ def _load_elements(elements_csv: str, emit=DEFAULT_EMIT) -> pd.DataFrame:
 
     df = df.copy()
 
-    # core ids
+    # core element string
     if "element" not in df.columns:
         df["element"] = df.get("token", df.index.astype(str))
     df["element"] = df["element"].astype(str)
 
+    # token column is optional, keep for regimes
     if "token" in df.columns:
         df["token"] = df["token"].astype(str)
     else:
         df["token"] = df["element"]
 
-    # normalise entropy/coherence naming
-    if "mean_entropy" not in df.columns and "entropy" in df.columns:
-        df["mean_entropy"] = df["entropy"]
-    if "mean_coherence" not in df.columns and "coherence" in df.columns:
-        df["mean_coherence"] = df["coherence"]
+    # normalise entropy / coherence naming
+    if "mean_entropy" not in df.columns or df["mean_entropy"].isna().all():
+        if "entropy" in df.columns:
+            df["mean_entropy"] = df["entropy"]
+        else:
+            df["mean_entropy"] = 0.0
+
+    if "mean_coherence" not in df.columns or df["mean_coherence"].isna().all():
+        if "coherence" in df.columns:
+            df["mean_coherence"] = df["coherence"]
+        else:
+            df["mean_coherence"] = 0.0
 
     df["mean_entropy"] = df["mean_entropy"].apply(_safe_float)
     df["mean_coherence"] = df["mean_coherence"].apply(_safe_float)
+
+    # stable element_id resolution
+    if "element_id" in df.columns and not df["element_id"].isna().all():
+        try:
+            df["element_id"] = df["element_id"].astype(int)
+        except Exception:
+            df["element_id"] = np.arange(len(df), dtype=int)
+    elif "index" in df.columns and not df["index"].isna().all():
+        try:
+            df["element_id"] = df["index"].astype(int)
+        except Exception:
+            df["element_id"] = np.arange(len(df), dtype=int)
+    else:
+        df["element_id"] = np.arange(len(df), dtype=int)
 
     _log(
         emit,
@@ -137,7 +181,13 @@ def _load_elements(elements_csv: str, emit=DEFAULT_EMIT) -> pd.DataFrame:
 def _load_edges(edges_csv: str,
                 elements_df: pd.DataFrame,
                 emit=DEFAULT_EMIT) -> pd.DataFrame:
-    """Load co-occurrence edges and restrict to known elements."""
+    """
+    Load co-occurrence edges and restrict to known elements.
+
+    Compatible with both legacy edges (source, target, weight) and
+    upgraded graph contract edges (source, target, weight, scaled_weight,
+    confidence, polarity, is_backbone, source_id, target_id).
+    """
     df = _load_df(edges_csv, ["source", "target", "weight"], emit)
     if df.empty:
         _log(emit, "warn", "[molecule] edges.csv empty", path=edges_csv)
@@ -148,12 +198,36 @@ def _load_edges(edges_csv: str,
     df["target"] = df["target"].astype(str)
     df["weight"] = df["weight"].apply(_safe_float)
 
+    # optional fields from graph contract
+    if "confidence" not in df.columns:
+        df["confidence"] = 1.0
+    else:
+        df["confidence"] = df["confidence"].apply(_safe_float)
+
+    if "scaled_weight" not in df.columns:
+        df["scaled_weight"] = 1.0
+    else:
+        df["scaled_weight"] = df["scaled_weight"].apply(_safe_float)
+
+    if "is_backbone" not in df.columns:
+        df["is_backbone"] = False
+    else:
+        # normalise to bool
+        df["is_backbone"] = df["is_backbone"].astype(bool)
+
     valid = set(elements_df["element"])
+    before = len(df)
     df = df[df["source"].isin(valid) & df["target"].isin(valid)]
     df = df[df["source"] != df["target"]]
 
     if df.empty:
-        _log(emit, "warn", "[molecule] No valid edges after filtering.", path=edges_csv)
+        _log(
+            emit,
+            "warn",
+            "[molecule] No valid edges after filtering.",
+            path=edges_csv,
+            before=before,
+        )
     else:
         _log(
             emit,
@@ -223,9 +297,17 @@ def _load_regimes(elements_csv: str, emit=DEFAULT_EMIT) -> Dict[str, Dict[str, f
 def _connected_components(edges: pd.DataFrame,
                           elements_df: pd.DataFrame,
                           emit=DEFAULT_EMIT) -> List[List[str]]:
-    """Return a list of components, each a list of element_ids."""
+    """
+    Return list of components, each a list of element strings.
+
+    If edges are empty, treat each element as its own singleton molecule.
+    """
     if edges.empty:
-        _log(emit, "warn", "[molecule] No edges: treating each element as singleton.",)
+        _log(
+            emit,
+            "warn",
+            "[molecule] No edges: treating each element as singleton component.",
+        )
         return [[el] for el in elements_df["element"].tolist()]
 
     neighbors: Dict[str, set] = {}
@@ -265,7 +347,13 @@ def _connected_components(edges: pd.DataFrame,
 
 
 def _compute_local_stability(edges: pd.DataFrame) -> Dict[str, float]:
-    """Return element→mean_edge_weight map."""
+    """
+    Compute element → local_stability as mean effective edge weight.
+
+    Effective weight uses:
+        effective_weight = weight * confidence
+    where confidence defaults to 1 if missing.
+    """
     if edges.empty:
         return {}
 
@@ -273,8 +361,10 @@ def _compute_local_stability(edges: pd.DataFrame) -> Dict[str, float]:
     for _, row in edges.iterrows():
         s, t = row["source"], row["target"]
         w = _safe_float(row["weight"], 0.0)
-        weights.setdefault(s, []).append(w)
-        weights.setdefault(t, []).append(w)
+        c = _safe_float(row.get("confidence", 1.0), 1.0)
+        eff = w * c
+        weights.setdefault(s, []).append(eff)
+        weights.setdefault(t, []).append(eff)
 
     return {el: float(np.mean(ws)) for el, ws in weights.items()}
 
@@ -286,11 +376,18 @@ def build_molecule_df(
     emit=DEFAULT_EMIT,
 ) -> pd.DataFrame:
     """
-    Produce a row-per-element molecule_df with:
+    Produce a row-per-element molecule table:
 
-      compound_id, element, degree,
-      local_stability, mean_entropy_elem, mean_coherence_elem,
-      info_score, misinfo_score, disinfo_score
+      compound_id,
+      element,
+      element_id,
+      degree,
+      local_stability,
+      mean_entropy_elem,
+      mean_coherence_elem,
+      info_score,
+      misinfo_score,
+      disinfo_score
     """
     if elements_df.empty:
         _log(emit, "warn", "[molecule] Empty element table; aborting molecule build.")
@@ -299,31 +396,34 @@ def build_molecule_df(
     comps = _connected_components(edges, elements_df, emit)
     local = _compute_local_stability(edges)
 
+    # quick lookup maps
+    entropy_map = elements_df.set_index("element")["mean_entropy"].to_dict()
+    coher_map = elements_df.set_index("element")["mean_coherence"].to_dict()
+    id_map = elements_df.set_index("element")["element_id"].to_dict()
+
     rows: List[Dict[str, Any]] = []
     for idx, comp in enumerate(comps, start=1):
         cid = f"C{idx:04d}"
         for el in comp:
             el = str(el)
-            sub = elements_df.loc[elements_df["element"] == el]
+            deg = 0
+            if not edges.empty:
+                deg = int(
+                    edges[
+                        (edges["source"] == el) | (edges["target"] == el)
+                    ].shape[0]
+                )
 
             row: Dict[str, Any] = {
                 "compound_id": cid,
                 "element": el,
-                "degree": int(
-                    edges[
-                        (edges["source"] == el) | (edges["target"] == el)
-                    ].shape[0]
-                ),
+                "element_id": int(id_map.get(el, -1)),
+                "degree": deg,
                 "local_stability": float(local.get(el, 0.0)),
-                "mean_entropy_elem": float(sub["mean_entropy"].mean())
-                if not sub.empty
-                else 0.0,
-                "mean_coherence_elem": float(sub["mean_coherence"].mean())
-                if not sub.empty
-                else 0.0,
+                "mean_entropy_elem": float(entropy_map.get(el, 0.0)),
+                "mean_coherence_elem": float(coher_map.get(el, 0.0)),
             }
 
-            # append regime scores if available
             r = regimes.get(el, {})
             row["info_score"] = float(r.get("info", 0.0))
             row["misinfo_score"] = float(r.get("misinfo", 0.0))
@@ -351,7 +451,13 @@ def build_molecule_df(
 
 def add_temperature(molecule_df: pd.DataFrame,
                     emit=DEFAULT_EMIT) -> pd.DataFrame:
-    """T = normalized(mean_entropy - mean_coherence)."""
+    """
+    Temperature model:
+
+        T = normalized(mean_entropy_elem - mean_coherence_elem)
+
+    Returns a new DataFrame with added "temperature" column.
+    """
     if molecule_df.empty:
         return molecule_df
 
@@ -379,14 +485,25 @@ def aggregate_compounds(
     regimes: Dict[str, Dict[str, float]],
     emit=DEFAULT_EMIT,
 ) -> pd.DataFrame:
-    """Aggregate per-compound metrics (stability, temperature, regime scores)."""
+    """
+    Aggregate per-compound metrics:
+
+      compound_id,
+      num_elements,
+      num_bonds,
+      compound_stability,
+      mean_local_stability,
+      mean_temperature,
+      mean_info,
+      mean_misinfo,
+      mean_disinfo
+    """
     if molecule_df.empty:
         _log(emit, "warn", "[molecule] Empty molecule table; cannot aggregate.")
         return pd.DataFrame()
 
     comp_map = molecule_df.set_index("element")["compound_id"].to_dict()
 
-    # per-compound bond counts & weights
     bond_counts: Dict[str, int] = {}
     wcollect: Dict[str, List[float]] = {}
 
@@ -412,7 +529,6 @@ def aggregate_compounds(
         mis = float(group["misinfo_score"].mean())
         dis = float(group["disinfo_score"].mean())
 
-        # compound stability: mean of bond weights if available
         cstab = float(np.mean(wcollect[cid])) if cid in wcollect else mean_ls
 
         rows.append(
@@ -457,7 +573,22 @@ def export_compounds(
     compound_df: pd.DataFrame,
     emit=DEFAULT_EMIT,
 ) -> None:
-    """Export informational_compounds.json from molecule/compound tables."""
+    """
+    Export informational_compounds.json from molecule and compound tables.
+
+    Schema (per compound):
+      {
+        compound_id: str,
+        elements: [element, ...],
+        num_elements: int,
+        num_bonds: int,
+        stability: float,
+        temperature: float,
+        info: float,
+        mis: float,
+        dis: float
+      }
+    """
     if compound_df.empty:
         _log(emit, "warn", "[molecule] No compounds to export.")
         return
@@ -506,7 +637,7 @@ def run_molecule_stage(
     emit=DEFAULT_EMIT,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Main entry point for orchestrator (new name).
+    Main entry point for orchestrator.
 
     Reads:
       - hilbert_elements.csv
@@ -515,7 +646,8 @@ def run_molecule_stage(
 
     Writes:
       - informational_compounds.json
-      - returns (molecule_df, compound_df)
+    Returns:
+      - molecule_df, compound_df
     """
     el_path = os.path.join(results_dir, "hilbert_elements.csv")
     edges_path = os.path.join(results_dir, "edges.csv")
@@ -537,15 +669,15 @@ def run_molecule_stage(
     return molecule_df, compound_df
 
 
-# Backwards-compatible alias for orchestrator imports
+# Backwards compatible alias for orchestrator imports
 def run_molecule_layer(results_dir: str, emit=DEFAULT_EMIT):
     """Alias so orchestrator can import run_molecule_layer(...)."""
     return run_molecule_stage(results_dir, emit=emit)
 
 
-# -------------------------------------------------------------------------#
-# Backwards-compat convenience helpers
-# -------------------------------------------------------------------------#
+# -------------------------------------------------------------------------
+# Backwards compat convenience helpers
+# -------------------------------------------------------------------------
 
 def compute_molecule_stability(
     edges_csv: str,

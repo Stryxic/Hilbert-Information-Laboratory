@@ -3,12 +3,18 @@ prep_graph.py - Edge scoring and intelligent pruning for Hilbert graphs.
 
 This module is loaded BEFORE layouts and styling in the visualizer
 pipeline. It enriches the graph with importance-weighted edges and applies
-a configurable pruning policy to reduce visual clutter.
+a configurable pruning and structural analysis policy to reduce visual
+clutter.
 
 Outputs:
     - edge importance scores added to G[u][v]["importance"]
-    - pruned edges removed from the graph
+    - optional edge pruning applied in-place
+    - node-level structural tags for:
+        * isolates
+        * rare leaves
+        * degree-2 chains
     - pruning_metadata.json written to results_dir
+    - graph_structure_metadata.json written to results_dir
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from typing import Dict, Tuple, Any, Optional, Literal
+from typing import Dict, Tuple, Any, Optional, Literal, List
 
 import numpy as np
 import networkx as nx
@@ -98,6 +104,150 @@ def score_edges(G: nx.Graph, *, emit=None) -> None:
 
     if emit:
         emit("log", {"message": f"[prep_graph] Scored {len(edges)} edges"})
+
+
+# --------------------------------------------------------------------------- #
+# Structural simplification analysis (pre-layout)
+# --------------------------------------------------------------------------- #
+
+def _find_isolates_and_leaves(G: nx.Graph) -> Tuple[List[str], List[str]]:
+    degrees = dict(G.degree())
+    isolates = [n for n, d in degrees.items() if d == 0]
+    leaves = [n for n, d in degrees.items() if d == 1]
+    return isolates, leaves
+
+
+def _estimate_rare_leaves(
+    G: nx.Graph,
+    leaves: List[str],
+    rare_threshold: float = 0.05,
+) -> List[str]:
+    """
+    Approximate "occur only once in corpus" by using the normalised doc_freq
+    field written by loader. Nodes with doc_freq <= rare_threshold are treated
+    as rare.
+    """
+    rare = []
+    for n in leaves:
+        df = float(G.nodes[n].get("doc_freq", 1.0))
+        if df <= rare_threshold:
+            rare.append(n)
+    return rare
+
+
+def _find_degree2_chains(G: nx.Graph) -> List[List[str]]:
+    """
+    Identify maximal simple chains of degree-2 nodes.
+
+    These chains can be treated as polyline segments when considering
+    pre-layout condensation or force tuning.
+
+    Returned as a list of node lists, each representing a chain
+    (internal nodes mostly degree-2).
+    """
+    degrees = dict(G.degree())
+    deg2_nodes = {n for n, d in degrees.items() if d == 2}
+    visited: set[str] = set()
+    chains: List[List[str]] = []
+
+    for start in list(deg2_nodes):
+        if start in visited:
+            continue
+
+        if degrees.get(start, 0) != 2:
+            continue
+
+        # Grow in both directions
+        neighbors = list(G.neighbors(start))
+        if len(neighbors) != 2:
+            continue
+
+        chain = [start]
+        visited.add(start)
+
+        # extend in direction 0
+        for dir_idx in (0, 1):
+            current = neighbors[dir_idx]
+            prev = start
+            while current in deg2_nodes and current not in visited:
+                chain.append(current)
+                visited.add(current)
+                neighs = list(G.neighbors(current))
+                # move to the neighbor that is not prev
+                next_nodes = [x for x in neighs if x != prev]
+                if len(next_nodes) != 1:
+                    break
+                prev, current = current, next_nodes[0]
+
+        # normalise order
+        if len(chain) >= 2:
+            chains.append(chain)
+
+    return chains
+
+
+def analyse_and_tag_structure(
+    G: nx.Graph,
+    *,
+    remove_isolates: bool = True,
+    rare_leaf_threshold: float = 0.05,
+    emit=None,
+) -> Dict[str, Any]:
+    """
+    Analyse graph structure for:
+        - isolates (degree 0)
+        - rare leaves (degree 1, low doc_freq)
+        - degree-2 chains
+
+    Tags nodes with attributes:
+        - hilbert_isolate: bool
+        - hilbert_leaf_contract: bool
+        - hilbert_chain_id: int
+
+    Optionally removes isolates from the working graph, since they
+    do not affect layout or connectivity.
+
+    Returns a metadata dict summarising the analysis.
+    """
+    isolates, leaves = _find_isolates_and_leaves(G)
+    rare_leaves = _estimate_rare_leaves(G, leaves, rare_threshold=rare_leaf_threshold)
+    chains = _find_degree2_chains(G)
+
+    # Tag isolates
+    for n in isolates:
+        G.nodes[n]["hilbert_isolate"] = True
+
+    # Tag rare leaves that are good candidates for contraction treatment
+    for n in rare_leaves:
+        G.nodes[n]["hilbert_leaf_contract"] = True
+
+    # Tag chains
+    for cid, chain_nodes in enumerate(chains, start=1):
+        for n in chain_nodes:
+            G.nodes[n]["hilbert_chain_id"] = int(cid)
+
+    # Optionally remove isolates (they will not take part in layout)
+    removed_isolates = []
+    if remove_isolates and isolates:
+        for n in isolates:
+            if n in G:
+                G.remove_node(n)
+                removed_isolates.append(n)
+
+    meta = {
+        "n_isolates_detected": len(isolates),
+        "n_isolates_removed": len(removed_isolates),
+        "n_leaves_detected": len(leaves),
+        "rare_leaf_threshold": float(rare_leaf_threshold),
+        "n_rare_leaves_tagged": len(rare_leaves),
+        "n_degree2_chains": len(chains),
+        "chains_example": chains[:5],  # small sample for debugging
+    }
+
+    if emit:
+        emit("log", {"message": f"[prep_graph] Structure: {meta}"})
+
+    return meta
 
 
 # --------------------------------------------------------------------------- #
@@ -267,6 +417,17 @@ def write_pruning_metadata(results_dir: str, meta: Dict[str, Any]) -> str:
     return path
 
 
+def write_structure_metadata(results_dir: str, meta: Dict[str, Any]) -> str:
+    """Write structural analysis metadata to results_dir/graph_structure_metadata.json"""
+    path = os.path.join(results_dir, "graph_structure_metadata.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # High-level orchestration used by visualizer
 # --------------------------------------------------------------------------- #
@@ -277,28 +438,44 @@ def prepare_graph_for_visualization(
     *,
     pruning_mode: str = "median_strength",
     topk: int = 2000,
+    remove_isolates: bool = True,
+    rare_leaf_threshold: float = 0.05,
     emit=None,
 ) -> nx.Graph:
     """
     Complete preprocessing step:
-        1. Score edges
-        2. Apply pruning
-        3. Write pruning metadata
+        1. Analyse and tag structural simplifications
+           (isolates, rare leaves, degree-2 chains)
+        2. Score edges
+        3. Apply pruning
+        4. Write structure and pruning metadata
 
-    Returns the modified graph.
+    Returns the modified graph (in-place).
     """
 
+    # 1. Structural analysis and soft condensation tags
+    struct_meta = analyse_and_tag_structure(
+        G,
+        remove_isolates=remove_isolates,
+        rare_leaf_threshold=rare_leaf_threshold,
+        emit=emit,
+    )
+    struct_path = write_structure_metadata(results_dir, struct_meta)
+    if emit:
+        emit("artifact", {"kind": "graph-structure-metadata", "path": struct_path})
+
+    # 2. Edge scoring
     score_edges(G, emit=emit)
 
-    meta = prune_edges(
+    # 3. Edge pruning
+    prune_meta = prune_edges(
         G,
         mode=pruning_mode,
         topk=topk,
         emit=emit,
     )
-
-    meta_path = write_pruning_metadata(results_dir, meta)
+    prune_path = write_pruning_metadata(results_dir, prune_meta)
     if emit:
-        emit("artifact", {"kind": "pruning-metadata", "path": meta_path})
+        emit("artifact", {"kind": "pruning-metadata", "path": prune_path})
 
     return G

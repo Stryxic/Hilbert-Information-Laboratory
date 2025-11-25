@@ -10,8 +10,10 @@ Responsibilities:
 
 Layout geometry is assumed to be handled upstream by layout3d; here we:
     - apply mild importance-based radial warping
+    - apply stability/community-based z-jitter to avoid flat rings
     - use depth to attenuate colours and edge opacity (depth fog)
     - use degree-based "ambient occlusion" to darken dense cores
+    - apply simple directional lighting to enhance shape perception
     - standardise camera and framing
 """
 
@@ -193,7 +195,50 @@ def draw_3d_snapshot(
     radii_new = radii * scale
     P_new = centroid + directions * radii_new[:, None]
 
-    # Write back warped positions
+    # ------------------------------------------------------------------ #
+    # Stability / community-based z-jitter to avoid flat rings
+    # ------------------------------------------------------------------ #
+    # 1) Try stability / temperature
+    stab_vals = []
+    for n in nodes:
+        d = G.nodes[n]
+        if "stability" in d:
+            stab_vals.append(float(d.get("stability", 0.0)))
+        elif "temperature" in d:
+            stab_vals.append(float(d.get("temperature", 0.0)))
+        else:
+            stab_vals.append(0.5)
+    stab_arr = np.array(stab_vals, float)
+    stab_norm = _norm01(stab_arr)
+
+    # 2) Fallback / blend with community id to get structured bands
+    comm_ids = [G.nodes[n].get("community_id") for n in nodes]
+    if any(c is not None for c in comm_ids):
+        # map community ids deterministically to [-0.5, 0.5]
+        uniq = sorted({str(c) for c in comm_ids if c is not None})
+        if uniq:
+            comm_map = {cid: i / max(1, len(uniq) - 1 or 1) for i, cid in enumerate(uniq)}
+            comm_vals = np.array(
+                [comm_map.get(str(c), 0.5) if c is not None else 0.5 for c in comm_ids],
+                float,
+            )
+            comm_centered = comm_vals - 0.5
+        else:
+            comm_centered = np.zeros_like(stab_norm)
+    else:
+        comm_centered = np.zeros_like(stab_norm)
+
+    # Blend stability and community for jitter sign & magnitude
+    jitter_driver = 0.6 * (stab_norm - 0.5) + 0.4 * comm_centered
+
+    # Scale jitter by vertical span so it is layout-scale aware but gentle
+    z_span = max(float(P_new[:, 2].max() - P_new[:, 2].min()), 1e-9)
+    jitter_scale = 0.15 * z_span  # ~15% of vertical span
+    z_jitter = jitter_scale * jitter_driver
+
+    P_new[:, 2] = P_new[:, 2] + z_jitter
+
+    # Write back warped + jittered positions
     for i, n in enumerate(nodes):
         x, y, z = P_new[i]
         pos[n] = (float(x), float(y), float(z))
@@ -232,7 +277,7 @@ def draw_3d_snapshot(
     ax.view_init(elev=elev, azim=azim)
 
     # ------------------------------------------------------------------ #
-    # Depth helpers
+    # Depth helpers and lighting
     # ------------------------------------------------------------------ #
     # Recompute projected depth for each node
     ea = np.deg2rad(elev)
@@ -246,7 +291,7 @@ def draw_3d_snapshot(
         float,
     )
 
-    node_depth = {}
+    node_depth: Dict[str, float] = {}
     for n in nodes:
         x, y, z = pos[n]
         node_depth[n] = float(np.dot(np.array([x, y, z], float), cam_dir))
@@ -261,6 +306,21 @@ def draw_3d_snapshot(
     deg_norm = _norm01(deg_arr)
     occlusion = deg_norm  # 0 = isolated, 1 = very dense core
 
+    # Simple directional lighting: light from top-front-right
+    light_dir = np.array([0.6, 0.4, 0.7], float)
+    light_dir /= np.linalg.norm(light_dir) + 1e-12
+    node_pos_vecs = np.array([[pos[n][0], pos[n][1], pos[n][2]] for n in nodes], float)
+    node_pos_norm = node_pos_vecs / (
+        np.linalg.norm(node_pos_vecs, axis=1, keepdims=True) + 1e-12
+    )
+    lambert = np.clip(
+        np.sum(node_pos_norm * light_dir[None, :], axis=1),
+        -1.0,
+        1.0,
+    )
+    # convert to a [0.7, 1.1] brightness factor
+    light_factor = 0.7 + 0.4 * (lambert * 0.5 + 0.5)
+
     # ------------------------------------------------------------------ #
     # Edges with depth-aware alpha and mild occlusion
     # ------------------------------------------------------------------ #
@@ -271,6 +331,9 @@ def draw_3d_snapshot(
         base_alpha = (
             style.edge_alpha_dense if len(nodes) > 700 else style.edge_alpha_sparse
         )
+
+    # Precompute index lookups to avoid repeated list.index calls
+    idx_map = {n: i for i, n in enumerate(nodes)}
 
     for u, v, depth in _depth_sorted_edges_3d(G, pos, azim=azim, elev=elev):
         if u not in pos or v not in pos:
@@ -298,10 +361,12 @@ def draw_3d_snapshot(
         depth_fog = 0.35 + 0.65 * (1.0 - depth_norm_edge)
 
         # occlusion based on endpoints' degree
-        oc_u = occlusion[nodes.index(u)] if u in nodes else 0.0
-        oc_v = occlusion[nodes.index(v)] if v in nodes else 0.0
+        iu = idx_map.get(u, None)
+        iv = idx_map.get(v, None)
+        oc_u = occlusion[iu] if iu is not None else 0.0
+        oc_v = occlusion[iv] if iv is not None else 0.0
         oc_edge = 0.5 * (oc_u + oc_v)
-        ao_factor = 0.4 + 0.6 * (1.0 - oc_edge)  # high-degree edges darker
+        ao_factor = 0.4 + 0.6 * (1.0 - oc_edge)  # high-degree edges darker/fainter
 
         alpha = float(np.clip(a0 * base_alpha * depth_fog * ao_factor, 0.0, 1.0))
 
@@ -318,7 +383,7 @@ def draw_3d_snapshot(
         )
 
     # ------------------------------------------------------------------ #
-    # Nodes: halo + core with depth-aware alpha and occlusion
+    # Nodes: halo + core with depth-aware alpha, occlusion, and lighting
     # ------------------------------------------------------------------ #
     halo_map = node_styles.halo_sizes or {}
     color_map = node_styles.colors or {}
@@ -346,18 +411,30 @@ def draw_3d_snapshot(
     ao_nodes = 0.4 + 0.6 * (1.0 - occlusion)  # dense core slightly darkened
     fog = depth_fog_nodes * ao_nodes
 
-    halo_colors = cols.copy()
-    core_colors = cols.copy()
-    halo_colors[:, 3] = np.clip(
-        halo_colors[:, 3] * fog * style.node_halo_alpha,
-        0.0,
-        1.0,
+    # Apply lighting as a mild brightness modulation on RGB only
+    rgb = cols[:, :3]
+    alpha_base = cols[:, 3]
+
+    rgb_lit = rgb * light_factor[:, None]
+    rgb_lit = np.clip(rgb_lit, 0.0, 1.0)
+
+    halo_colors = np.concatenate(
+        [
+            rgb_lit,
+            (alpha_base * fog * style.node_halo_alpha)[:, None],
+        ],
+        axis=1,
     )
-    core_colors[:, 3] = np.clip(
-        core_colors[:, 3] * fog * style.node_alpha,
-        0.0,
-        1.0,
+    halo_colors[:, 3] = np.clip(halo_colors[:, 3], 0.0, 1.0)
+
+    core_colors = np.concatenate(
+        [
+            rgb_lit,
+            (alpha_base * fog * style.node_alpha)[:, None],
+        ],
+        axis=1,
     )
+    core_colors[:, 3] = np.clip(core_colors[:, 3], 0.0, 1.0)
 
     xs = np.array([pos[n][0] for n in nodes], float)
     ys = np.array([pos[n][1] for n in nodes], float)
@@ -396,10 +473,10 @@ def draw_3d_snapshot(
 
     if label_budget > 0 and label_map:
         # combine importance (size) and nearness for label ranking
-        rank_score = {}
+        rank_score: Dict[str, float] = {}
         for i, n in enumerate(nodes):
             score = 0.7 * size_norm[i] + 0.3 * (1.0 - depth_norm[i])
-            rank_score[n] = score
+            rank_score[n] = float(score)
 
         candidates = sorted(
             [n for n in nodes if n in label_map],
