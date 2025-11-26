@@ -88,25 +88,29 @@ class RunImporter:
             manifest=manifest,
         )
 
-    def import_from_fileobj(
-        self,
-        fileobj: IO[bytes],
-        run_id: Optional[str] = None,
-    ) -> ImportedRun:
+    def import_from_fileobj(self, fileobj, *, run_id: str) -> ImportedRun:
         """
-        Import a ZIP provided as a file-like object.
+        Read export ZIP bytes from a file-like object and import it.
+        Windows-safe: ensures temporary file handle is closed before re-opening.
         """
-        with tempfile.NamedTemporaryFile(prefix="hilbert_import_", suffix=".zip") as tmp:
-            # Stream to the temp file
-            while True:
-                chunk = fileobj.read(8192)
-                if not chunk:
-                    break
-                tmp.write(chunk)
-            tmp.flush()
+        import tempfile
+        import os
 
-            # Delegate to import_from_zip_path
-            return self.import_from_zip_path(tmp.name, run_id=run_id)
+        # Write to a temp file, but CLOSE IT before reading again
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            tmp.write(fileobj.read())
+            tmp_path = tmp.name  # we will reopen it later
+
+        # Now the file handle is closed, safe to reopen
+        try:
+            return self.import_from_zip_path(tmp_path, run_id=run_id)
+        finally:
+            # Attempt cleanup (Windows will allow it now)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
 
     def import_if_not_cached(
         self,

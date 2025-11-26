@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 """
-Hilbert Orchestrator 4.0
-Database-integrated deterministic pipeline execution.
+Hilbert Orchestrator 4.1
+Database-integrated deterministic pipeline execution with stage events.
 
 This orchestrator:
 
@@ -11,6 +11,7 @@ This orchestrator:
 - Produces deterministic exports consumed by hilbert_import
 - Stores all artifacts in the DB + object store
 - Persists run status and metadata
+- Emits structured stage / run events for UI progress streaming
 """
 
 import json
@@ -19,18 +20,15 @@ import time
 import shutil
 import random
 from dataclasses import dataclass, field
-
 from typing import Any, Callable, Dict, List, Optional
+
 try:
     from typing import Literal
 except ImportError:
     from typing_extensions import Literal
 
-
 import numpy as np
 import pandas as pd
-
-
 
 from hilbert_db.core import HilbertDB
 from hilbert_pipeline import (
@@ -50,7 +48,7 @@ from hilbert_pipeline import (
 )
 from hilbert_pipeline.hilbert_export import run_full_export
 
-ORCHESTRATOR_VERSION = "4.0"
+ORCHESTRATOR_VERSION = "4.1"
 
 
 # ----------------------------------------------------------------------
@@ -144,10 +142,11 @@ class PipelineContext:
         try:
             self.emit("log", entry)
         except Exception:
+            # Last-resort fallback to stdout
             print(f"[{level}] {msg} {fields}")
 
     # ------------------------------------------------------------------
-    # Stage lifecycle
+    # Stage lifecycle helpers
     # ------------------------------------------------------------------
 
     def begin_stage(self, spec: StageSpec) -> StageState:
@@ -158,35 +157,35 @@ class PipelineContext:
         self.log("info", f"{spec.label} - starting", stage=spec.key)
         return st
 
-    def end_stage_ok(self, spec: StageSpec, meta: Dict[str, Any] = None):
+    def end_stage_ok(self, spec: StageSpec, meta: Optional[Dict[str, Any]] = None) -> None:
         st = self.stages[spec.key]
         st.status = "ok"
         st.end_ts = time.time()
         if meta:
             st.meta.update(meta)
-        self.log("info", f"{spec.label} - ok", duration=st.duration)
+        self.log("info", f"{spec.label} - ok", stage=spec.key, duration=st.duration)
 
-    def end_stage_failed(self, spec: StageSpec, error: str):
+    def end_stage_failed(self, spec: StageSpec, error: str) -> None:
         st = self.stages[spec.key]
         st.status = "failed"
         st.end_ts = time.time()
         st.error = error
-        self.log("error", f"{spec.label} - failed: {error}")
+        self.log("error", f"{spec.label} - failed: {error}", stage=spec.key)
 
-    def end_stage_skipped(self, spec: StageSpec, reason: str):
+    def end_stage_skipped(self, spec: StageSpec, reason: str) -> None:
         st = self.stages.get(spec.key) or StageState(spec.key, spec.label)
         st.status = "skipped"
         st.error = reason
         st.start_ts = st.start_ts or time.time()
         st.end_ts = time.time()
         self.stages[spec.key] = st
-        self.log("warn", f"{spec.label} - skipped ({reason})")
+        self.log("warn", f"{spec.label} - skipped ({reason})", stage=spec.key)
 
     # ------------------------------------------------------------------
     # Artifacts
     # ------------------------------------------------------------------
 
-    def add_artifact(self, name: str, kind: str, **meta):
+    def add_artifact(self, name: str, kind: str, **meta: Any) -> None:
         path = os.path.join(self.results_dir, name)
         self.artifacts[name] = {
             "kind": kind,
@@ -199,7 +198,7 @@ class PipelineContext:
 # Utility helpers
 # ----------------------------------------------------------------------
 
-def _ensure_dir(p: str):
+def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
@@ -234,9 +233,10 @@ def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
         else:
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as fs, \
-                     open(out_dir / rel.name, "w", encoding="utf-8") as fd:
+                        open(out_dir / rel.name, "w", encoding="utf-8") as fd:
                     fd.write(fs.read())
             except Exception:
+                # Non-fatal; skip unreadable files
                 pass
 
     return str(dst_root)
@@ -246,7 +246,7 @@ def _prepare_lsa_corpus(ctx: PipelineContext) -> str:
 # Stage implementations
 # ----------------------------------------------------------------------
 
-def _stage_lsa(ctx: PipelineContext):
+def _stage_lsa(ctx: PipelineContext) -> None:
     corpus = _prepare_lsa_corpus(ctx)
     res = build_lsa_field(corpus, emit=ctx.emit) or {}
     ctx.extras["lsa_result"] = res
@@ -267,7 +267,6 @@ def _stage_lsa(ctx: PipelineContext):
     p = os.path.join(ctx.results_dir, "lsa_field.json")
     with open(p, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
-
     ctx.add_artifact("lsa_field.json", "lsa-field")
 
     elements = res.get("elements", [])
@@ -283,24 +282,23 @@ def _stage_lsa(ctx: PipelineContext):
 
     merged = el_df.merge(met_df, on=["element", "index"], how="left")
     merged.to_csv(os.path.join(ctx.results_dir, "hilbert_elements.csv"), index=False)
-
     ctx.add_artifact("hilbert_elements.csv", "elements")
 
 
-def _stage_fusion(ctx: PipelineContext):
+def _stage_fusion(ctx: PipelineContext) -> None:
     run_fusion_pipeline(ctx.results_dir, emit=ctx.emit)
     f = os.path.join(ctx.results_dir, "span_element_fusion.csv")
     if os.path.exists(f):
         ctx.add_artifact("span_element_fusion.csv", "fusion")
 
 
-def _stage_edges(ctx: PipelineContext):
+def _stage_edges(ctx: PipelineContext) -> None:
     out = build_element_edges(ctx.results_dir, emit=ctx.emit)
     if out:
         ctx.add_artifact(os.path.basename(out), "edges")
 
 
-def _stage_molecules(ctx: PipelineContext):
+def _stage_molecules(ctx: PipelineContext) -> None:
     run_molecule_layer(ctx.results_dir, emit=ctx.emit)
     for x in ["molecules.csv", "informational_compounds.json"]:
         p = os.path.join(ctx.results_dir, x)
@@ -308,7 +306,7 @@ def _stage_molecules(ctx: PipelineContext):
             ctx.add_artifact(x, "molecules")
 
 
-def _stage_element_roots(ctx: PipelineContext):
+def _stage_element_roots(ctx: PipelineContext) -> None:
     run_element_roots(ctx.results_dir, emit=ctx.emit)
     for x in ["element_roots.csv", "element_cluster_metrics.json"]:
         p = os.path.join(ctx.results_dir, x)
@@ -316,7 +314,7 @@ def _stage_element_roots(ctx: PipelineContext):
             ctx.add_artifact(x, "element-roots")
 
 
-def _stage_stability(ctx: PipelineContext):
+def _stage_stability(ctx: PipelineContext) -> None:
     compute_signal_stability(
         os.path.join(ctx.results_dir, "hilbert_elements.csv"),
         os.path.join(ctx.results_dir, "signal_stability.csv"),
@@ -327,7 +325,7 @@ def _stage_stability(ctx: PipelineContext):
         ctx.add_artifact("signal_stability.csv", "stability")
 
 
-def _stage_compound_stability(ctx: PipelineContext):
+def _stage_compound_stability(ctx: PipelineContext) -> None:
     compute_compound_stability(
         compounds_json=os.path.join(ctx.results_dir, "informational_compounds.json"),
         elements_csv=os.path.join(ctx.results_dir, "hilbert_elements.csv"),
@@ -339,7 +337,7 @@ def _stage_compound_stability(ctx: PipelineContext):
         ctx.add_artifact("compound_stability.csv", "compound-stability")
 
 
-def _stage_persistence(ctx: PipelineContext):
+def _stage_persistence(ctx: PipelineContext) -> None:
     run_persistence_visuals(ctx.results_dir, emit=ctx.emit)
     for x in [
         "persistence_field.png",
@@ -350,7 +348,7 @@ def _stage_persistence(ctx: PipelineContext):
             ctx.add_artifact(x, "persistence")
 
 
-def _stage_element_labels(ctx: PipelineContext):
+def _stage_element_labels(ctx: PipelineContext) -> None:
     spans = ctx.extras.get("lsa_result", {}).get("field", {}).get("span_map", [])
     build_element_descriptions(
         os.path.join(ctx.results_dir, "hilbert_elements.csv"),
@@ -362,26 +360,26 @@ def _stage_element_labels(ctx: PipelineContext):
             ctx.add_artifact(x, "labels")
 
 
-def _stage_signatures(ctx: PipelineContext):
+def _stage_signatures(ctx: PipelineContext) -> None:
     out = compute_signatures(ctx.results_dir, emit=ctx.emit)
     if out:
         ctx.add_artifact(os.path.basename(out), "signatures")
 
 
-def _stage_element_lm(ctx: PipelineContext):
+def _stage_element_lm(ctx: PipelineContext) -> None:
     run_element_lm_stage(ctx.results_dir, emit=ctx.emit)
     for x in ["element_lm.pt", "element_vocab.json"]:
         if os.path.exists(os.path.join(ctx.results_dir, x)):
             ctx.add_artifact(x, "element-lm")
 
 
-def _stage_perplexity(ctx: PipelineContext):
+def _stage_perplexity(ctx: PipelineContext) -> None:
     text = ctx.extras.get("corpus_text")
 
     if not text:
         spans = os.path.join(ctx.results_dir, "spans.jsonl")
         if os.path.exists(spans):
-            parts = []
+            parts: List[str] = []
             with open(spans, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
@@ -397,56 +395,129 @@ def _stage_perplexity(ctx: PipelineContext):
     ctx.add_artifact("lm_metrics.json", "lm-metrics")
 
 
-def _stage_export(ctx: PipelineContext):
+def _stage_export(ctx: PipelineContext) -> None:
+    """
+    Deterministic export stage.
+
+    - Builds hilbert_manifest.json
+    - Creates run_<ts>.zip
+    - Registers both as artifacts so they are pushed to the object store
+      and the ZIP key can be recorded as export_key on the run.
+    """
     run_full_export(ctx.results_dir, emit=ctx.emit)
-    # artifacts will be registered after run finishes
+
+    # Manifest
+    manifest_name = "hilbert_manifest.json"
+    manifest_path = os.path.join(ctx.results_dir, manifest_name)
+    if os.path.exists(manifest_path):
+        ctx.add_artifact(manifest_name, "hilbert_manifest_json")
+
+    # ZIP archive name is derived from the results directory basename
+    run_name = os.path.basename(os.path.abspath(ctx.results_dir).rstrip(os.sep))
+    zip_name = f"{run_name}.zip"
+    zip_path = os.path.join(ctx.results_dir, zip_name)
+    if os.path.exists(zip_path):
+        ctx.add_artifact(zip_name, "hilbert_export_zip")
 
 
 # ----------------------------------------------------------------------
 # Stage Table
 # ----------------------------------------------------------------------
 
-STAGE_TABLE = [
-    StageSpec("lsa_field", 1.0, "LSA spectral field", _stage_lsa,
-              dialectic_role="evidence",
-              supports=["fusion", "edges"]),
-
-    StageSpec("fusion", 2.0, "Span–element fusion", _stage_fusion,
-              depends_on=["lsa_field"]),
-
-    StageSpec("edges", 2.5, "Element edges", _stage_edges,
-              depends_on=["fusion"]),
-
-    StageSpec("molecules", 3.0, "Molecule layer", _stage_molecules,
-              depends_on=["edges"]),
-
-    StageSpec("element_roots", 3.5, "Element roots", _stage_element_roots,
-              depends_on=["molecules"]),
-
-    StageSpec("stability_metrics", 4.0, "Stability metrics", _stage_stability,
-              depends_on=["lsa_field"]),
-
-    StageSpec("compound_stability", 4.5, "Compound stability", _stage_compound_stability,
-              depends_on=["stability_metrics", "molecules"]),
-
-    StageSpec("persistence", 5.0, "Persistence visuals", _stage_persistence,
-              depends_on=["stability_metrics"]),
-
-    StageSpec("element_labels", 6.0, "Element labels", _stage_element_labels,
-              depends_on=["lsa_field"]),
-
-    StageSpec("epistemic_signatures", 6.5, "Epistemic signatures", _stage_signatures,
-              depends_on=["element_labels", "stability_metrics"]),
-
-    StageSpec("element_lm", 6.8, "Element LM", _stage_element_lm,
-              depends_on=["fusion"]),
-
-    StageSpec("lm_perplexity", 6.85, "LM Perplexity", _stage_perplexity,
-              depends_on=["lsa_field"]),
-
-    StageSpec("export_all", 8.0, "Deterministic Export", _stage_export,
-              depends_on=["element_labels", "compound_stability", "lm_perplexity"],
-              dialectic_role="export"),
+STAGE_TABLE: List[StageSpec] = [
+    StageSpec(
+        "lsa_field",
+        1.0,
+        "LSA spectral field",
+        _stage_lsa,
+        dialectic_role="evidence",
+        supports=["fusion", "edges"],
+    ),
+    StageSpec(
+        "fusion",
+        2.0,
+        "Span–element fusion",
+        _stage_fusion,
+        depends_on=["lsa_field"],
+    ),
+    StageSpec(
+        "edges",
+        2.5,
+        "Element edges",
+        _stage_edges,
+        depends_on=["fusion"],
+    ),
+    StageSpec(
+        "molecules",
+        3.0,
+        "Molecule layer",
+        _stage_molecules,
+        depends_on=["edges"],
+    ),
+    StageSpec(
+        "element_roots",
+        3.5,
+        "Element roots",
+        _stage_element_roots,
+        depends_on=["molecules"],
+    ),
+    StageSpec(
+        "stability_metrics",
+        4.0,
+        "Stability metrics",
+        _stage_stability,
+        depends_on=["lsa_field"],
+    ),
+    StageSpec(
+        "compound_stability",
+        4.5,
+        "Compound stability",
+        _stage_compound_stability,
+        depends_on=["stability_metrics", "molecules"],
+    ),
+    StageSpec(
+        "persistence",
+        5.0,
+        "Persistence visuals",
+        _stage_persistence,
+        depends_on=["stability_metrics"],
+    ),
+    StageSpec(
+        "element_labels",
+        6.0,
+        "Element labels",
+        _stage_element_labels,
+        depends_on=["lsa_field"],
+    ),
+    StageSpec(
+        "epistemic_signatures",
+        6.5,
+        "Epistemic signatures",
+        _stage_signatures,
+        depends_on=["element_labels", "stability_metrics"],
+    ),
+    StageSpec(
+        "element_lm",
+        6.8,
+        "Element LM",
+        _stage_element_lm,
+        depends_on=["fusion"],
+    ),
+    StageSpec(
+        "lm_perplexity",
+        6.85,
+        "LM Perplexity",
+        _stage_perplexity,
+        depends_on=["lsa_field"],
+    ),
+    StageSpec(
+        "export_all",
+        8.0,
+        "Deterministic Export",
+        _stage_export,
+        depends_on=["element_labels", "compound_stability", "lm_perplexity"],
+        dialectic_role="export",
+    ),
 ]
 
 
@@ -463,7 +534,19 @@ def run_hilbert_orchestration(
     settings: Optional[PipelineSettings] = None,
     emit: Optional[EmitFn] = None,
 ) -> Dict[str, Any]:
+    """
+    Run the full Hilbert pipeline for a corpus.
 
+    Emits structured events:
+
+        emit("run_start", {...})
+        emit("stage_start", {...})
+        emit("stage_end", {...})
+        emit("run_end", {...})
+
+    where payloads always include at least: run_id, stage (for stage_*) and
+    orchestrator_version.
+    """
     settings = settings or PipelineSettings()
     emit = emit or DEFAULT_EMIT
 
@@ -472,15 +555,18 @@ def run_hilbert_orchestration(
 
     _ensure_dir(results_dir)
 
-    # Register corpus
-    fingerprint = str(int(time.time()))  # Replace with real hash in production
+    # ------------------------------------------------------------------
+    # Register corpus and run
+    # ------------------------------------------------------------------
+
+    # TODO: replace with real content-hash fingerprint
+    fingerprint = str(int(time.time()))
     corpus = db.get_or_create_corpus(
         fingerprint=fingerprint,
         name=corpus_name,
         source_uri=corpus_dir,
     )
 
-    # Create run
     run_id = str(int(time.time() * 1000))
     run = db.create_run(
         run_id=run_id,
@@ -489,7 +575,8 @@ def run_hilbert_orchestration(
         settings_json=settings.__dict__,
     )
 
-    db.mark_run_running(run_id)
+    if hasattr(db, "mark_run_running"):
+        db.mark_run_running(run_id)
 
     ctx = PipelineContext(
         corpus_dir=os.path.abspath(corpus_dir),
@@ -500,10 +587,29 @@ def run_hilbert_orchestration(
         db=db,
     )
 
+    # Announce run start
+    emit(
+        "run_start",
+        {
+            "run_id": run_id,
+            "corpus_id": corpus.corpus_id,
+            "orchestrator_version": ORCHESTRATOR_VERSION,
+            "settings": settings.__dict__,
+            "ts": time.time(),
+        },
+    )
+
+    ordered_specs = sorted(STAGE_TABLE, key=lambda s: s.order)
+    total_stages = len(ordered_specs)
+
+    # ------------------------------------------------------------------
     # Execute stages
-    for spec in sorted(STAGE_TABLE, key=lambda s: s.order):
+    # ------------------------------------------------------------------
+
+    for idx, spec in enumerate(ordered_specs):
         unmet = [
-            d for d in spec.depends_on
+            d
+            for d in spec.depends_on
             if ctx.stages.get(d, StageState(d, d)).status != "ok"
         ]
 
@@ -511,22 +617,98 @@ def run_hilbert_orchestration(
             if spec.required:
                 ctx.begin_stage(spec)
                 ctx.end_stage_failed(spec, f"Missing dependencies: {unmet}")
+                st = ctx.stages[spec.key]
+                emit(
+                    "stage_end",
+                    {
+                        "run_id": run_id,
+                        "stage": spec.key,
+                        "label": spec.label,
+                        "status": st.status,
+                        "error": st.error,
+                        "duration": st.duration,
+                        "index": idx,
+                        "total_stages": total_stages,
+                    },
+                )
+                # Hard failure: stop pipeline
                 break
             else:
                 ctx.end_stage_skipped(spec, f"Missing deps: {unmet}")
+                st = ctx.stages[spec.key]
+                emit(
+                    "stage_end",
+                    {
+                        "run_id": run_id,
+                        "stage": spec.key,
+                        "label": spec.label,
+                        "status": st.status,
+                        "error": st.error,
+                        "duration": st.duration,
+                        "index": idx,
+                        "total_stages": total_stages,
+                    },
+                )
                 continue
 
+        # Normal stage execution
         ctx.begin_stage(spec)
+        emit(
+            "stage_start",
+            {
+                "run_id": run_id,
+                "stage": spec.key,
+                "label": spec.label,
+                "index": idx,
+                "total_stages": total_stages,
+                "ts": time.time(),
+            },
+        )
+
         try:
             if spec.func is not None:
                 spec.func(ctx)
             ctx.end_stage_ok(spec)
         except Exception as exc:
             ctx.end_stage_failed(spec, str(exc))
+            # Emit and bail if required
+            st = ctx.stages[spec.key]
+            emit(
+                "stage_end",
+                {
+                    "run_id": run_id,
+                    "stage": spec.key,
+                    "label": spec.label,
+                    "status": st.status,
+                    "error": st.error,
+                    "duration": st.duration,
+                    "index": idx,
+                    "total_stages": total_stages,
+                },
+            )
             if spec.required:
                 break
+        else:
+            # Successful completion
+            st = ctx.stages[spec.key]
+            emit(
+                "stage_end",
+                {
+                    "run_id": run_id,
+                    "stage": spec.key,
+                    "label": spec.label,
+                    "status": st.status,
+                    "error": st.error,
+                    "duration": st.duration,
+                    "index": idx,
+                    "total_stages": total_stages,
+                },
+            )
 
-    # Write hilbert_run.json
+    # ------------------------------------------------------------------
+    # Write hilbert_run.json summary
+    # ------------------------------------------------------------------
+
     summary_path = os.path.join(ctx.results_dir, "hilbert_run.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -552,7 +734,12 @@ def run_hilbert_orchestration(
         )
     ctx.add_artifact("hilbert_run.json", "run-summary")
 
-    # Store run artifacts into DB + object store
+    # ------------------------------------------------------------------
+    # Store run artifacts in DB + object store
+    # ------------------------------------------------------------------
+
+    export_key: Optional[str] = None
+
     for name, info in ctx.artifacts.items():
         local_path = info["path"]
         kind = info["kind"]
@@ -563,6 +750,11 @@ def run_hilbert_orchestration(
             with open(local_path, "rb") as f:
                 db.object_store.save_bytes(key, f.read())
 
+        # If this is the deterministic export ZIP, remember its key so
+        # the DB can later reconstruct an import root via load_imported_run.
+        if kind == "hilbert_export_zip":
+            export_key = key
+
         db.register_artifact(
             run_id=run_id,
             name=name,
@@ -571,9 +763,51 @@ def run_hilbert_orchestration(
             meta=meta,
         )
 
-    db.mark_run_ok(run_id)
+    # Record export_key on the run so hilbert_db.apis.* can call
+    # db.load_imported_run(run_id) and find the ZIP in the object store.
+    if export_key:
+        # Try a few plausible DB APIs, but never crash if they are absent.
+        if hasattr(db, "set_run_export_key"):
+            db.set_run_export_key(run_id, export_key)  # type: ignore[attr-defined]
+        elif hasattr(db, "update_run_export_key"):
+            db.update_run_export_key(run_id, export_key)  # type: ignore[attr-defined]
+        elif hasattr(db, "mark_run_export"):
+            db.mark_run_export(run_id, export_key)  # type: ignore[attr-defined]
+        elif hasattr(db, "update_run"):
+            try:
+                db.update_run(run_id=run_id, export_key=export_key)  # type: ignore[arg-type]
+            except Exception:
+                # Best-effort only
+                pass
 
-    return {"run_id": run_id, "corpus_id": corpus.corpus_id, "results_dir": results_dir}
+    # Mark run status in DB (best-effort)
+    if hasattr(db, "mark_run_ok"):
+        db.mark_run_ok(run_id)
+
+    # Emit run completion event
+    emit(
+        "run_end",
+        {
+            "run_id": run_id,
+            "corpus_id": corpus.corpus_id,
+            "orchestrator_version": ORCHESTRATOR_VERSION,
+            "stages": {
+                k: {
+                    "status": st.status,
+                    "error": st.error,
+                    "duration": st.duration,
+                }
+                for k, st in ctx.stages.items()
+            },
+            "ts": time.time(),
+        },
+    )
+
+    return {
+        "run_id": run_id,
+        "corpus_id": corpus.corpus_id,
+        "results_dir": results_dir,
+    }
 
 
 __all__ = [

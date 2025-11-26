@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Optional
 # ======================================================================
 
 def DEFAULT_EMIT(kind: str, payload: Optional[Dict[str, Any]] = None) -> None:
-    """Fallback 'do nothing' emitter."""
+    """Fallback no-op event emitter."""
     return None
 
 
@@ -25,9 +25,7 @@ def DEFAULT_EMIT(kind: str, payload: Optional[Dict[str, Any]] = None) -> None:
 # LSA layer
 # ======================================================================
 
-from .lsa_layer import (
-    build_lsa_field,
-)
+from .lsa_layer import build_lsa_field
 
 
 # ======================================================================
@@ -43,25 +41,20 @@ from .molecule_layer import (
 )
 
 def build_molecules(*args, **kwargs):
-    """Backwards-compatible alias for older orchestrator code."""
+    """Backwards compatible alias."""
     return run_molecule_stage(*args, **kwargs)
 
 def run_molecule_layer(*args, **kwargs):
-    """Alias for run_molecule_stage."""
     return run_molecule_stage(*args, **kwargs)
 
 
 # ======================================================================
-# Span–element fusion + compound context
+# Fusion layer (spans -> elements + compound context)
 # ======================================================================
 
-from .fusion import (
-    fuse_spans_to_elements,
-    aggregate_compound_context,
-)
+from .fusion import fuse_spans_to_elements, aggregate_compound_context
 
 def run_fusion_pipeline(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
-    """Thin wrapper combining fusion + compound aggregation."""
     fuse_spans_to_elements(results_dir, emit=emit)
     aggregate_compound_context(results_dir, emit=emit)
 
@@ -70,9 +63,7 @@ def run_fusion_pipeline(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None
 # Element labels
 # ======================================================================
 
-from .element_labels import (
-    build_element_descriptions,
-)
+from .element_labels import build_element_descriptions
 
 
 # ======================================================================
@@ -89,25 +80,14 @@ def run_persistence_visuals(results_dir: str, emit: Callable = DEFAULT_EMIT) -> 
 
 
 # ======================================================================
-# Graphs
-# ======================================================================
-
-
-
-# ======================================================================
-# Export (PDF + ZIP)
+# Export (deterministic manifest + ZIP)
 # ======================================================================
 
 from .hilbert_export import (
-    export_summary_pdf,
+    build_manifest,
     export_zip,
+    run_full_export,
 )
-
-def run_full_export(results_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
-    emit("log", {"stage": "export", "event": "start"})
-    export_summary_pdf(results_dir)
-    export_zip(results_dir)
-    emit("log", {"stage": "export", "event": "end"})
 
 
 # ======================================================================
@@ -118,7 +98,7 @@ from .signatures import compute_signatures
 
 
 # ======================================================================
-# Optional: Element Language Model (safe import)
+# Element LM (optional)
 # ======================================================================
 
 try:
@@ -130,7 +110,6 @@ try:
 except Exception as exc:
     print(f"[hilbert_pipeline] Element LM unavailable: {exc}")
 
-    # Safe fallback stubs so orchestrator import NEVER fails
     def run_element_lm_stage(*args, **kwargs):
         print("[element_lm] Skipped: module unavailable")
 
@@ -141,13 +120,36 @@ except Exception as exc:
         return 0.0
 
 
-#Meta
+# ======================================================================
+# Edges builder
+# ======================================================================
 
-from hilbert_pipeline.corpus_probe import probe_corpus, run_lsa_seed_profile
+from .edges_builder import build_element_edges
 
 
 # ======================================================================
-# Public API
+# Corpus probing (diagnostics)
+# ======================================================================
+
+from .corpus_probe import probe_corpus, run_lsa_seed_profile
+
+
+# ======================================================================
+# Element roots
+# ======================================================================
+
+from .element_roots import run_element_roots
+
+
+# ======================================================================
+# Perplexity (Ollama LM)
+# ======================================================================
+
+from .ollama_lm import compute_corpus_perplexity
+
+
+# ======================================================================
+# Public API surface
 # ======================================================================
 
 __all__ = [
@@ -174,40 +176,35 @@ __all__ = [
     # Labels
     "build_element_descriptions",
 
-    # Stability + persistence
+    # Stability + visuals
     "compute_signal_stability",
+    "compute_compound_stability",
     "plot_persistence_field",
     "run_persistence_visuals",
 
-    # Graphs
-    "generate_graph_snapshots",
-    "export_graph_snapshots",
-
     # Export
-    "export_summary_pdf",
+    "build_manifest",
     "export_zip",
     "run_full_export",
 
-    # Epistemic signatures
+    # Signatures
     "compute_signatures",
 
-    # Element LM (optional but guaranteed to exist)
+    # Edges
+    "build_element_edges",
+
+    # Element LM
     "run_element_lm_stage",
     "suggest_next_elements",
     "score_element_sequence",
+
+    # Corpus diagnostics
+    "probe_corpus",
+    "run_lsa_seed_profile",
+
+    # Roots
+    "run_element_roots",
+
+    # LM perplexity
+    "compute_corpus_perplexity",
 ]
-
-from .edges_builder import build_element_edges
-__all__ += ["build_element_edges"]
-
-# backend/hilbert_pipeline/__init__.py
-from .ollama_lm import compute_corpus_perplexity  # new export
-__all__ += ["compute_corpus_perplexity"]
-
-from .corpus_probe import probe_corpus, run_lsa_seed_profile
-
-__all__ += ["probe_corpus", "run_lsa_seed_profile"]
-
-from .element_roots import run_element_roots
-
-__all__ += ["run_element_roots"]

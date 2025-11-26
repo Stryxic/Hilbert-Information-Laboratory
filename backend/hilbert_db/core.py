@@ -314,6 +314,19 @@ class HilbertDB:
         return self._set_run_status(run_id, "failed", finished=True)
 
     # ------------------------------------------------------------------
+    # Export key helper for orchestrator 4.x
+    # ------------------------------------------------------------------
+
+    def set_run_export_key(self, run_id: str, export_key: str) -> None:
+        """
+        Backwards-compatible helper required by orchestrator 4.x.
+
+        Delegates to DBRunRegistry.set_export_key, which already knows how
+        to talk to the underlying DB / DBPool.
+        """
+        self.run_registry.set_export_key(run_id, export_key)
+
+    # ------------------------------------------------------------------
     # Artifact + export handling
     # ------------------------------------------------------------------
 
@@ -384,8 +397,8 @@ class HilbertDB:
             data = f.read()
         self.object_store.save_bytes(key, data)
 
-        # Record export key on the run
-        self.run_registry.set_export_key(run_id, key)
+        # Record export key on the run (via helper used by orchestrator 4.x)
+        self.set_run_export_key(run_id, key)
 
         # Register as an artifact
         return self.register_artifact(

@@ -1,0 +1,298 @@
+/* ======================================================================
+   Hilbert Lab - Corpora Dashboard (Standalone Dark Theme)
+   ====================================================================== */
+
+/* -------------------------- */
+/* Reset & base               */
+/* -------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont,
+    "SF Pro Text", "Segoe UI", sans-serif;
+  background-color: #010409;
+  color: #e6edf3;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* -------------------------- */
+/* Layout grid (3 panes)      */
+/* -------------------------- */
+
+.corpora-page {
+  display: grid;
+  grid-template-columns: 280px 420px 1fr;
+  height: calc(100vh - 52px); /* below header bar */
+  width: 100%;
+  overflow: hidden;
+  background: #010409;
+  color: #e6edf3;
+}
+
+/* ======================================================================
+   LEFT PANE : CORPORA
+   ====================================================================== */
+
+.corpora-left {
+  padding: 20px 18px;
+  background: #0d1117;
+  border-right: 1px solid #30363d;
+  overflow-y: auto;
+
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.corpora-header h1 {
+  font-size: 20px;
+  margin: 0 0 6px 0;
+  color: #e6edf3;
+}
+
+.corpora-header p {
+  font-size: 13px;
+  color: #8b949e;
+  margin: 0 0 14px 0;
+}
+
+/* Upload block */
+
+.corpora-upload-block {
+  padding: 10px 0 16px 0;
+  border-bottom: 1px solid #21262d;
+  margin-bottom: 18px;
+}
+
+.corpora-upload-label {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: #e6edf3;
+}
+
+.corpora-upload-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+/* make the label look like a button but keep input clickable */
+.corpora-upload-file-input {
+  display: none;
+}
+
+.corpora-upload-selected {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8b949e;
+}
+
+/* Heading for corpora list */
+
+.corpora-left h2 {
+  font-size: 15px;
+  margin: 4px 0 8px 0;
+}
+
+/* Corpora list placeholder */
+
+.corpus-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.corpus-item {
+  background: #161b22;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #21262d;
+  cursor: default;
+}
+
+.corpus-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.corpus-meta {
+  font-size: 12px;
+  color: #8b949e;
+}
+
+.empty-note {
+  font-size: 13px;
+  color: #8b949e;
+  line-height: 1.5;
+  margin-top: 6px;
+}
+
+/* ======================================================================
+   MIDDLE PANE : RUNS
+   ====================================================================== */
+
+.corpora-middle {
+  padding: 20px 18px;
+  background: #020617;
+  border-right: 1px solid #30363d;
+  overflow-y: auto;
+}
+
+.corpora-middle h2 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.middle-subtitle {
+  margin: 4px 0 10px 0;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.runs-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-item {
+  background: #161b22;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #21262d;
+  cursor: pointer;
+  transition: background 0.15s ease, border 0.15s ease;
+}
+
+.run-item:hover {
+  background: rgba(88, 166, 255, 0.12);
+}
+
+.run-item.selected {
+  background: rgba(88, 166, 255, 0.18);
+  border-color: #58a6ff;
+}
+
+.run-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.run-meta {
+  font-size: 12px;
+  color: #8b949e;
+}
+
+/* ======================================================================
+   RIGHT PANE : RUN OVERVIEW
+   ====================================================================== */
+
+.corpora-right {
+  padding: 20px 22px;
+  background: #161b22;
+  overflow-y: auto;
+  color: #e6edf3;
+}
+
+.corpora-right h2 {
+  margin: 0 0 10px 0;
+  font-size: 18px;
+}
+
+.section-card {
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 14px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+}
+
+.section-row {
+  display: flex;
+  flex-direction: column;
+}
+
+.section-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.section-subtitle {
+  font-size: 12px;
+  color: #8b949e;
+}
+
+.section-actions {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* ======================================================================
+   Buttons
+   ====================================================================== */
+
+.hil-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  color: #e6edf3;
+  cursor: pointer;
+  transition: background 0.15s ease, border 0.15s ease, opacity 0.15s ease;
+}
+
+.hil-btn:hover {
+  background: #161b22;
+}
+
+.hil-btn-primary {
+  background: rgba(88, 166, 255, 0.18);
+  border-color: #58a6ff;
+  color: #58a6ff;
+}
+
+.hil-btn-disabled,
+.hil-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ======================================================================
+   Scrollbars
+   ====================================================================== */
+
+.corpora-left::-webkit-scrollbar,
+.corpora-middle::-webkit-scrollbar,
+.corpora-right::-webkit-scrollbar {
+  width: 6px;
+}
+
+.corpora-left::-webkit-scrollbar-thumb,
+.corpora-middle::-webkit-scrollbar-thumb,
+.corpora-right::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 10px;
+}
