@@ -1,56 +1,71 @@
-# =============================================================================
-# hilbert_pipeline/persistence_visuals.py — Stability & Persistence Visuals (v3.1)
-# =============================================================================
 """
-Generates persistence and stability visualizations from pipeline outputs.
+persistence_visuals.py
+======================
 
-Inputs in `out_dir`:
+Hilbert Information Pipeline – Persistence and Stability Visuals (v3.1)
+-----------------------------------------------------------------------
 
-  - signal_stability.csv
-      Old schema (span-level):
-        index, entropy, coherence, stability, ...
-      New schema (element-level or doc-level):
-        doc, element, entropy, coherence, stability, ...
+This module generates all *visual diagnostics* for the Hilbert Information
+Pipeline, including:
 
-  - hilbert_elements.csv
-      Element-level metrics:
-        element, [doc], mean_entropy, mean_coherence, ...
+1. **Signal stability profile** – plots stability across spans or elements.
+2. **Element entropy–coherence field** – core epistemic-geometry diagram.
+3. **Mean document stability** – shows how information quality varies across documents.
+4. **Document-level entropy/coherence summary** – complementary profile showing
+   document-scale informational structure.
 
-  - graph_stability_nodes.csv (optional, from stability_layer)
-      Graph-contract ready node metrics:
-        element, element_id, entropy, coherence, stability, tf, df, idf, tfidf, lsa0, lsa1, lsa2
+Each visual corresponds directly to structures defined in the thesis, allowing
+the diagrams produced here to be embedded in Chapter 6 (Hilbert Information
+Detection Tool) and Chapter 7 (Hilbert Epistemic Geometry).
 
-Outputs (PNG):
+Inputs
+------
 
-  - persistence_field.png
-        1D profile of stability over spans or elements.
+The following files are expected in the run directory:
 
-  - stability_scatter.png
-        entropy vs coherence scatter for elements, optionally colored by stability.
+``signal_stability.csv``  
+    Stability signals for spans or elements. Must contain:
+    - ``stability``
+    - ``doc`` (optional)
+    - ``element`` (optional)
+    - index or span identifiers (various legacy names)
 
-  - stability_by_doc.png
-        Mean stability per document (if doc info exists in signal_stability.csv).
+``hilbert_elements.csv``  
+    Element-level metrics (entropy, coherence, tf/df/idf/etc).
 
-  - stability_doc_entropy_heatmap.png (optional)
-        Doc-level entropy vs coherence summary if doc columns exist in
-        hilbert_elements.csv and or signal_stability.csv.
+``graph_stability_nodes.csv`` *(optional)*  
+    Provides stable alignment between LSA spectral field and stability.
 
-Graph visualizer helper:
+Outputs
+-------
 
-  - persistence_visuals_index.json
-        Index of produced plots for the frontend or graph visualizer.
+``persistence_field.png``  
+    1-D stability signal over spans or elements.
 
-Public API used by the orchestrator:
+``stability_scatter.png``  
+    Entropy–coherence diagram (optionally coloured by stability).
 
-    from hilbert_pipeline.persistence_visuals import run_persistence_visuals
+``stability_by_doc.png``  
+    Mean document stability bar chart.
 
-    run_persistence_visuals(results_dir, emit=ctx.emit)
+``stability_doc_entropy_heatmap.png``  
+    Normalised document-level entropy/coherence overlay.
+
+``persistence_visuals_index.json``  
+    Machine-readable index consumed by frontend and graph-visualiser.
+
+Public API
+----------
+
+.. autofunction:: plot_persistence_field  
+.. autofunction:: run_persistence_visuals
+
 """
 
 from __future__ import annotations
 
-import json
 import os
+import json
 from typing import Callable, Optional, Dict, Any
 
 import numpy as np
@@ -61,52 +76,80 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Logging utilities
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Logging
+# =============================================================================
 
-DEFAULT_EMIT: Callable = lambda *_: None  # noqa: E731
+DEFAULT_EMIT: Callable = lambda *_: None
 
 
-def _log(
-    msg: str,
-    emit: Callable = DEFAULT_EMIT,
-    level: str = "info",
-    **fields: Any,
-) -> None:
+def _log(msg: str, emit: Callable = DEFAULT_EMIT, level: str = "info", **fields):
+    """
+    Orchestrator-compatible logger.
+
+    Parameters
+    ----------
+    msg : str
+        Message text.
+    emit : callable
+        Logging callback with signature ``emit(kind, payload)``.
+    level : str
+        Severity level: "info", "warn", etc.
+    """
     payload = {"level": level, "msg": msg}
     payload.update(fields)
     print(f"[{level}] {msg} {fields}")
     try:
         emit("log", payload)
     except Exception:
-        # emit is best-effort only
         pass
 
 
+# =============================================================================
+# Helpers
+# =============================================================================
+
 def _safe_numeric(series, default: float = 0.0) -> np.ndarray:
+    """
+    Convert Series to numeric array with NaN replacement.
+
+    Returns
+    -------
+    numpy.ndarray
+    """
     if series is None:
         return np.array([default], dtype=float)
     arr = pd.to_numeric(series, errors="coerce").to_numpy()
-    arr = np.where(np.isfinite(arr), arr, default)
-    return arr
+    return np.where(np.isfinite(arr), arr, default)
 
 
-# ---------------------------------------------------------------------------
-# Core plotting function
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Core Visualisation Logic
+# =============================================================================
 
 def plot_persistence_field(out_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
     """
-    Generate persistence and stability figures for the current run.
+    Generate all persistence and stability figures for a single Hilbert run.
 
     Parameters
     ----------
     out_dir : str
-        Output directory where signal_stability.csv, hilbert_elements.csv and
-        optional graph_stability_nodes.csv live.
+        Directory containing signal_stability.csv, hilbert_elements.csv,
+        and optional graph_stability_nodes.csv.
     emit : callable
-        Logger (kind, payload) compatible with PipelineContext.emit.
+        Orchestrator-compatible logger.
+
+    Notes
+    -----
+    This function produces all persistence/signal/stability diagrams described
+    in the Hilbert Epistemic Geometry chapter:
+
+    - Stability as an energy–like functional.
+    - Entropy–coherence phase field.
+    - Document-level information flow.
+
+    The output JSON index enables the frontend and visualiser to dynamically
+    load plots without guessing file names.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -117,46 +160,41 @@ def plot_persistence_field(out_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
     plots_index: Dict[str, Dict[str, Any]] = {}
     stab_df: Optional[pd.DataFrame] = None
 
-    # -----------------------------------------------------------------------
-    # 1. Load signal_stability.csv if available
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 1. Load signal_stability.csv
+    # -------------------------------------------------------------------------
     if os.path.exists(stab_path):
         try:
             stab_df = pd.read_csv(stab_path)
             if stab_df.empty:
-                _log("[persist] signal_stability.csv is empty; skipping line and doc plots.", emit, "warn")
+                _log("[persist] signal_stability.csv is empty; skipping.", emit, "warn")
                 stab_df = None
-        except Exception as e:
-            _log("[persist] Failed to read signal_stability.csv", emit, "warn", error=str(e))
+        except Exception as exc:
+            _log("[persist] Failed to read signal_stability.csv", emit, "warn", error=str(exc))
             stab_df = None
     else:
-        _log("[persist] signal_stability.csv not found; skipping persistence line and doc-level stability.", emit, "warn")
+        _log("[persist] signal_stability.csv missing; skipping line and doc plots.", emit, "warn")
 
-    # -----------------------------------------------------------------------
-    # 2. Persistence profile from signal_stability.csv
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 2. Persistence field: stability vs index
+    # -------------------------------------------------------------------------
     if stab_df is not None and "stability" in stab_df.columns:
         df = stab_df.copy()
 
-        # Determine index-like column
-        index_col = None
-        for cand in ("span_index", "index", "span_id", "row_id"):
-            if cand in df.columns:
-                index_col = cand
-                break
+        # Determine best available x-axis
+        index_col = next(
+            (c for c in ("span_index", "index", "span_id", "row_id") if c in df.columns),
+            None,
+        )
 
-        if index_col is not None:
-            x = _safe_numeric(df[index_col], default=0.0)
+        if index_col:
+            x = _safe_numeric(df[index_col])
             x_label = index_col
         else:
-            if "element" in df.columns:
-                x = np.arange(len(df))
-                x_label = "Element row index"
-            else:
-                x = np.arange(len(df))
-                x_label = "Row index"
+            x = np.arange(len(df))
+            x_label = "Row index"
 
-        y = _safe_numeric(df["stability"], default=0.0)
+        y = _safe_numeric(df["stability"])
 
         try:
             plt.figure(figsize=(8.5, 3.5))
@@ -168,8 +206,8 @@ def plot_persistence_field(out_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
             out_img = os.path.join(out_dir, "persistence_field.png")
             plt.savefig(out_img, dpi=200)
             plt.close()
-            _log("[persist] persistence_field.png written", emit, path=out_img)
 
+            _log("[persist] persistence_field.png written", emit, path=out_img)
             plots_index["persistence_field"] = {
                 "file": "persistence_field.png",
                 "kind": "line",
@@ -180,118 +218,96 @@ def plot_persistence_field(out_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
                 emit("artifact", {"path": out_img, "kind": "persistence_field"})
             except Exception:
                 pass
-        except Exception as e:
-            _log("[persist] Failed to plot persistence field", emit, "warn", error=str(e))
-    else:
-        if stab_df is not None:
-            _log(
-                "[persist] signal_stability.csv has no usable 'stability' column; skipping persistence_field.png.",
-                emit,
-                "warn",
-            )
 
-    # -----------------------------------------------------------------------
-    # 3. Element entropy vs coherence scatter (colored by stability if possible)
-    # -----------------------------------------------------------------------
+        except Exception as exc:
+            _log("[persist] Failed to render persistence field", emit, "warn", error=str(exc))
+
+    # -------------------------------------------------------------------------
+    # 3. Entropy–coherence scatter (Hilbert phase field)
+    # -------------------------------------------------------------------------
     if not os.path.exists(elem_path):
-        _log("[persist] hilbert_elements.csv not found; skipping scatter.", emit, "warn")
+        _log("[persist] hilbert_elements.csv missing; skipping scatter.", emit, "warn")
         _write_index(out_dir, plots_index, emit)
         return
 
     try:
         edf = pd.read_csv(elem_path)
-    except Exception as e:
-        _log("[persist] Failed to read hilbert_elements.csv", emit, "warn", error=str(e))
+    except Exception as exc:
+        _log("[persist] Failed to read hilbert_elements.csv", emit, "warn", error=str(exc))
         _write_index(out_dir, plots_index, emit)
         return
 
-    # Normalize column names for entropy and coherence
+    # Resolve entropy/coherence fields
     if "entropy" not in edf.columns and "mean_entropy" in edf.columns:
         edf = edf.rename(columns={"mean_entropy": "entropy"})
     if "coherence" not in edf.columns and "mean_coherence" in edf.columns:
-        edf = edf.rename(columns={"coherence": "coherence"}) if "coherence" in edf.columns else edf.rename(columns={"mean_coherence": "coherence"})
+        edf = edf.rename(columns={"mean_coherence": "coherence"})
 
     if not {"entropy", "coherence"}.issubset(edf.columns):
-        _log("[persist] Missing entropy and or coherence columns; skipping scatter.", emit, "warn")
+        _log("[persist] Missing entropy/coherence; skipping scatter.", emit, "warn")
     else:
-        x = _safe_numeric(edf["entropy"], default=0.0)
-        y = _safe_numeric(edf["coherence"], default=0.0)
+        x = _safe_numeric(edf["entropy"])
+        y = _safe_numeric(edf["coherence"])
 
-        stability_series: Optional[np.ndarray] = None
+        stability_series = None
 
-        # Prefer graph_stability_nodes.csv if present
+        # Prefer graph_stability_nodes.csv
         if os.path.exists(graph_nodes_path):
             try:
                 gdf = pd.read_csv(graph_nodes_path)
                 if (
-                    not gdf.empty
-                    and "element" in gdf.columns
+                    "element" in gdf.columns
                     and "stability" in gdf.columns
                     and "element" in edf.columns
                 ):
                     merged = edf[["element"]].merge(
-                        gdf[["element", "stability"]].dropna(),
-                        on="element",
-                        how="left",
+                        gdf[["element", "stability"]], on="element", how="left"
                     )
                     stability_series = _safe_numeric(merged["stability"], default=np.nan)
-                    if not np.isfinite(stability_series).any():
-                        stability_series = None
-            except Exception as e:
-                _log("[persist] Failed to join graph_stability_nodes for coloring", emit, "warn", error=str(e))
+            except Exception:
                 stability_series = None
 
-        # If no graph node table, fall back to signal_stability.csv
+        # Fallback to signal_stability.csv
         if stability_series is None and stab_df is not None:
             if (
-                not stab_df.empty
-                and "element" in stab_df.columns
-                and "element" in edf.columns
+                "element" in stab_df.columns
                 and "stability" in stab_df.columns
+                and "element" in edf.columns
             ):
-                try:
-                    merged = edf[["element"]].merge(
-                        stab_df[["element", "stability"]].dropna(),
-                        on="element",
-                        how="left",
-                    )
-                    stability_series = _safe_numeric(merged["stability"], default=np.nan)
-                    if not np.isfinite(stability_series).any():
-                        stability_series = None
-                except Exception:
-                    stability_series = None
+                merged = edf[["element"]].merge(
+                    stab_df[["element", "stability"]], on="element", how="left"
+                )
+                stability_series = _safe_numeric(merged["stability"], default=np.nan)
 
         try:
-            plt.figure(figsize=(4.8, 4.8))
+            plt.figure(figsize=(5.0, 5.0))
             color_field = None
 
-            if stability_series is not None:
+            if stability_series is not None and np.isfinite(stability_series).any():
                 mask = np.isfinite(stability_series)
-                if mask.any():
-                    sc = plt.scatter(
-                        x[mask],
-                        y[mask],
-                        c=stability_series[mask],
-                        s=18,
-                        alpha=0.8,
-                        cmap="viridis",
-                    )
-                    plt.colorbar(sc, label="Stability")
-                    color_field = "stability"
-                else:
-                    plt.scatter(x, y, s=18, alpha=0.7)
+                sc = plt.scatter(
+                    x[mask],
+                    y[mask],
+                    c=stability_series[mask],
+                    cmap="viridis",
+                    s=22,
+                    alpha=0.85,
+                )
+                plt.colorbar(sc, label="Stability")
+                color_field = "stability"
             else:
-                plt.scatter(x, y, s=18, alpha=0.7)
+                plt.scatter(x, y, s=22, alpha=0.75)
 
-            plt.xlabel("Element entropy")
-            plt.ylabel("Element coherence")
-            plt.title("Element Stability Field")
+            plt.xlabel("Entropy")
+            plt.ylabel("Coherence")
+            plt.title("Entropy–Coherence Field")
             plt.tight_layout()
+
             out_img = os.path.join(out_dir, "stability_scatter.png")
             plt.savefig(out_img, dpi=200)
             plt.close()
-            _log("[persist] stability_scatter.png written", emit, path=out_img)
 
+            _log("[persist] stability_scatter.png written", emit, path=out_img)
             plots_index["stability_scatter"] = {
                 "file": "stability_scatter.png",
                 "kind": "scatter",
@@ -303,156 +319,138 @@ def plot_persistence_field(out_dir: str, emit: Callable = DEFAULT_EMIT) -> None:
                 emit("artifact", {"path": out_img, "kind": "stability_scatter"})
             except Exception:
                 pass
-        except Exception as e:
-            _log("[persist] Scatter plot failed", emit, "warn", error=str(e))
 
-    # -----------------------------------------------------------------------
-    # 4. Mean stability per document (if doc + stability info exist)
-    # -----------------------------------------------------------------------
+        except Exception as exc:
+            _log("[persist] Scatter plot failed", emit, "warn", error=str(exc))
+
+    # -------------------------------------------------------------------------
+    # 4. Mean stability per document
+    # -------------------------------------------------------------------------
     if (
         stab_df is not None
-        and not stab_df.empty
         and "doc" in stab_df.columns
         and "stability" in stab_df.columns
     ):
-        sdf = stab_df.copy()
-        sdf["stability"] = _safe_numeric(sdf["stability"], default=0.0)
-
         try:
+            sdf = stab_df.copy()
+            sdf["stability"] = _safe_numeric(sdf["stability"])
             doc_stats = (
                 sdf.groupby("doc")["stability"]
                 .mean()
                 .sort_values(ascending=False)
             )
+
             if not doc_stats.empty:
-                fig_width = max(4.0, 0.35 * len(doc_stats) + 1.5)
-                plt.figure(figsize=(fig_width, 3.5))
+                width = max(4.0, 0.32 * len(doc_stats) + 1.0)
+                plt.figure(figsize=(width, 3.6))
                 idx = np.arange(len(doc_stats))
-                plt.bar(idx, doc_stats.values, align="center")
-                plt.xticks(
-                    idx,
-                    [str(d)[:18] for d in doc_stats.index],
-                    rotation=45,
-                    ha="right",
-                )
-                plt.ylabel("Mean stability")
+                plt.bar(idx, doc_stats.values)
+                plt.xticks(idx, [str(d)[:18] for d in doc_stats.index],
+                           rotation=45, ha="right")
+                plt.ylabel("Mean Stability")
                 plt.title("Mean Stability by Document")
                 plt.tight_layout()
+
                 out_img = os.path.join(out_dir, "stability_by_doc.png")
                 plt.savefig(out_img, dpi=200)
                 plt.close()
-                _log("[persist] stability_by_doc.png written", emit, path=out_img)
 
+                _log("[persist] stability_by_doc.png written", emit, path=out_img)
                 plots_index["stability_by_doc"] = {
                     "file": "stability_by_doc.png",
                     "kind": "bar",
                     "x": "doc",
                     "y": "mean_stability",
                 }
-                try:
-                    emit("artifact", {"path": out_img, "kind": "stability_by_doc"})
-                except Exception:
-                    pass
-        except Exception as e:
-            _log("[persist] Mean stability-by-doc plot failed", emit, "warn", error=str(e))
+                emit("artifact", {"path": out_img, "kind": "stability_by_doc"})
+        except Exception as exc:
+            _log("[persist] Document stability plot failed", emit, "warn", error=str(exc))
 
-    # -----------------------------------------------------------------------
-    # 5. Optional doc-level entropy and coherence summary
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 5. Doc-level entropy and coherence summary
+    # -------------------------------------------------------------------------
     try:
         if "doc" in edf.columns and {"entropy", "coherence"}.issubset(edf.columns):
-            doc_agg = (
-                edf.groupby("doc")[["entropy", "coherence"]]
-                .mean()
-                .dropna()
-            )
-            if not doc_agg.empty:
-                e_norm = (doc_agg["entropy"] - doc_agg["entropy"].min()) / (
-                    doc_agg["entropy"].max() - doc_agg["entropy"].min() + 1e-9
-                )
-                c_norm = (doc_agg["coherence"] - doc_agg["coherence"].min()) / (
-                    doc_agg["coherence"].max() - doc_agg["coherence"].min() + 1e-9
-                )
+            doc_agg = edf.groupby("doc")[["entropy", "coherence"]].mean().dropna()
 
-                plt.figure(figsize=(4.8, 4.0))
+            if not doc_agg.empty:
+                ent = doc_agg["entropy"]
+                coh = doc_agg["coherence"]
+
+                e_norm = (ent - ent.min()) / (ent.max() - ent.min() + 1e-9)
+                c_norm = (coh - coh.min()) / (coh.max() - coh.min() + 1e-9)
+
+                plt.figure(figsize=(5.0, 4.2))
                 idx = np.arange(len(doc_agg))
-                plt.scatter(
-                    idx,
-                    e_norm,
-                    s=30,
-                    alpha=0.8,
-                    label="Entropy (norm)",
-                    marker="o",
-                )
-                plt.scatter(
-                    idx,
-                    c_norm,
-                    s=30,
-                    alpha=0.8,
-                    label="Coherence (norm)",
-                    marker="s",
-                )
-                plt.xticks(
-                    idx,
-                    [str(d)[:14] for d in doc_agg.index],
-                    rotation=45,
-                    ha="right",
-                )
-                plt.ylabel("Normalised value")
-                plt.title("Doc-level Entropy and Coherence Summary")
-                plt.legend(loc="best", fontsize=8)
+                plt.scatter(idx, e_norm, marker="o", s=28, alpha=0.8, label="Entropy (norm)")
+                plt.scatter(idx, c_norm, marker="s", s=28, alpha=0.8, label="Coherence (norm)")
+                plt.xticks(idx, [str(d)[:14] for d in doc_agg.index],
+                           rotation=45, ha="right")
+                plt.ylabel("Normalised Value")
+                plt.title("Doc-Level Entropy & Coherence Summary")
+                plt.legend(fontsize=8)
                 plt.tight_layout()
+
                 out_img = os.path.join(out_dir, "stability_doc_entropy_heatmap.png")
                 plt.savefig(out_img, dpi=200)
                 plt.close()
-                _log("[persist] stability_doc_entropy_heatmap.png written", emit, path=out_img)
 
+                _log("[persist] stability_doc_entropy_heatmap.png written", emit, path=out_img)
                 plots_index["stability_doc_entropy_heatmap"] = {
                     "file": "stability_doc_entropy_heatmap.png",
                     "kind": "scatter_multi",
-                    "x": "doc",
                     "series": ["entropy_norm", "coherence_norm"],
                 }
-                try:
-                    emit("artifact", {"path": out_img, "kind": "stability_doc_entropy_heatmap"})
-                except Exception:
-                    pass
-    except Exception as e:
-        _log("[persist] Doc-level summary plot failed", emit, "warn", error=str(e))
+                emit("artifact", {"path": out_img, "kind": "stability_doc_entropy_heatmap"})
+    except Exception as exc:
+        _log("[persist] Doc-level summary plot failed", emit, "warn", error=str(exc))
 
-    # -----------------------------------------------------------------------
-    # 6. Write persistence_visuals_index.json for the graph visualizer
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 6. Write visual index
+    # -------------------------------------------------------------------------
     _write_index(out_dir, plots_index, emit)
 
 
+# =============================================================================
+# Index Writer
+# =============================================================================
+
 def _write_index(out_dir: str, plots_index: Dict[str, Dict[str, Any]], emit: Callable) -> None:
-    """Write persistence_visuals_index.json describing produced plots."""
+    """
+    Write ``persistence_visuals_index.json`` describing all generated plots.
+
+    Used by the frontend to decide what plots exist for a given run.
+    """
     index_path = os.path.join(out_dir, "persistence_visuals_index.json")
     try:
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(plots_index, f, indent=2)
         _log("[persist] persistence_visuals_index.json written", emit, path=index_path)
-        try:
-            emit("artifact", {"path": index_path, "kind": "persistence_visuals_index"})
-        except Exception:
-            pass
-    except Exception as e:
-        _log("[persist] Failed to write persistence_visuals_index.json", emit, "warn", error=str(e))
+        emit("artifact", {"path": index_path, "kind": "persistence_visuals_index"})
+    except Exception as exc:
+        _log("[persist] Failed to write persistence_visuals_index.json", emit, "warn", error=str(exc))
 
 
-# ---------------------------------------------------------------------------
-# Orchestrator-facing wrapper
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Orchestrator Wrapper
+# =============================================================================
 
 def run_persistence_visuals(out_dir: str, emit: Optional[Callable] = None) -> None:
     """
-    Orchestrator wrapper that emits start and end events and delegates to
-    plot_persistence_field.
+    Orchestrator-facing wrapper for persistence visual generation.
 
-    Used in Pipeline stage:
+    Emits:
 
-        run_persistence_visuals(ctx.results_dir, emit=ctx.emit)
+    - ``pipeline: start`` event
+    - calls :func:`plot_persistence_field`
+    - ``pipeline: end`` event
+
+    Parameters
+    ----------
+    out_dir : str
+        Results directory.
+    emit : callable, optional
+        Orchestrator logging callback.
     """
     emit = emit or DEFAULT_EMIT
 

@@ -1,30 +1,95 @@
-# =============================================================================
-# hilbert_pipeline/stability_layer.py — Advanced Stability Layer (v3.1)
-# =============================================================================
 """
-Modern signal-stability computation compatible with the Hilbert Pipeline 3.1.
+stability_layer.py
+==================
 
-Features:
-  - Robust handling of entropy/coherence fields (classic, normalized,
-    entropy-weighted modes).
-  - Produces graph-contract compatible outputs for visualization:
-        graph_stability_nodes.csv
-        graph_stability_meta.json
-  - Continues to support legacy outputs:
-        signal_stability.csv
-        stability_meta.json
-        compound_stability.csv
-  - Zero-division and NaN protection.
+Hilbert Information Pipeline – Stability Layer (Pipeline v3.1)
+--------------------------------------------------------------
 
-Inputs:
-  hilbert_elements.csv        (canonical upstream element table)
-  molecules.csv               (optional compound structures)
-Outputs:
-  signal_stability.csv
-  stability_meta.json
-  graph_stability_nodes.csv
-  graph_stability_meta.json
-  compound_stability.csv      (from compound-level aggregator)
+This module computes **element-level stability signals** derived from each
+element’s *entropy–coherence* profile. Stability is used throughout the Hilbert
+Pipeline as an analogue of *local informational equilibrium*, following the
+Hilbert Field Equations (Appendix X of the thesis):
+
+.. math::
+
+    S(e) = f(H_e, C_e)
+
+where:
+- :math:`H_e` is element entropy,
+- :math:`C_e` is element coherence,
+- and :math:`f` is a stability functional depending on the chosen mode.
+
+Supported stability modes
+-------------------------
+
+1. **classic**
+
+.. math::
+
+    S = \\frac{C}{1 + H}
+
+2. **entropy_weighted**
+
+.. math::
+
+    S = C \\cdot e^{-H}
+
+3. **normalized**
+    - Normalize :math:`H` and :math:`C` to :math:`[0,1]`
+    - Compute:
+
+.. math::
+
+    S = C_{norm} (1 - H_{norm})
+
+The goal is not physical accuracy, but to provide a **monotonic, robust,
+interpretable stability signal** that aligns with Hilbert’s information
+equilibrium model across corpora.
+
+Outputs
+-------
+
+This layer writes up to **five artifacts** into the results directory:
+
+1. ``signal_stability.csv``  
+   Legacy stable schema used by older tools.
+
+2. ``stability_meta.json``  
+   Global statistics.
+
+3. ``graph_stability_nodes.csv``  
+   Graph-contract compliant node table (visualizer-ready).
+
+4. ``graph_stability_meta.json``  
+   Metadata for graph visualisation.
+
+5. ``compound_stability.csv``  
+   Produced by ``compute_compound_stability``.
+
+Inputs
+------
+
+- ``hilbert_elements.csv``  
+  Must contain at least:
+    - ``element``
+    - ``entropy`` or ``mean_entropy``
+    - ``coherence`` or ``mean_coherence``
+
+- ``molecules.csv`` (optional, for compound-level aggregation)
+
+Orchestrator Integration
+------------------------
+
+Used internally by the orchestrator steps:
+
+- ``_stage_stability``
+- ``_stage_compounds``
+
+and exposed publicly as:
+
+- ``compute_signal_stability``  
+- ``compute_compound_stability``
+
 """
 
 from __future__ import annotations
@@ -38,13 +103,26 @@ import numpy as np
 import pandas as pd
 
 
-# --------------------------------------------------------------------------- #
+# =============================================================================
 # Logging
-# --------------------------------------------------------------------------- #
+# =============================================================================
 
 DEFAULT_EMIT: Callable[[str, Dict[str, Any]], None] = lambda *_: None
 
-def _log(emit, level, msg, **fields):
+
+def _log(emit, level: str, msg: str, **fields):
+    """
+    Orchestrator-compatible logging wrapper.
+
+    Parameters
+    ----------
+    emit : callable
+        Logging callback from orchestrator.
+    level : str
+        Severity ("info", "warn", ...)
+    msg : str
+        Human-readable message.
+    """
     payload = {"level": level, "msg": msg}
     payload.update(fields)
     try:
@@ -53,26 +131,48 @@ def _log(emit, level, msg, **fields):
         print(f"[{level}] {msg} {fields}")
 
 
-# --------------------------------------------------------------------------- #
-# Numeric helpers
-# --------------------------------------------------------------------------- #
+# =============================================================================
+# Numeric Helpers
+# =============================================================================
 
-def _safe(series, default=0.0):
+def _safe(series: pd.Series, default=0.0) -> np.ndarray:
+    """
+    Convert Series to a numeric array with NaNs replaced by ``default``.
+
+    Parameters
+    ----------
+    series : pandas.Series
+    default : float
+
+    Returns
+    -------
+    numpy.ndarray
+    """
     arr = pd.to_numeric(series, errors="coerce").to_numpy()
     return np.where(np.isfinite(arr), arr, default)
 
 
-def _stab_classic(entropy, coherence):
+def _stab_classic(entropy: np.ndarray, coherence: np.ndarray) -> np.ndarray:
+    """Classic stability functional :math:`C / (1 + H)`."""
     entropy = np.maximum(entropy, 0.0)
     return coherence / (1.0 + entropy)
 
 
-def _stab_entropy_weighted(entropy, coherence):
+def _stab_entropy_weighted(entropy: np.ndarray, coherence: np.ndarray) -> np.ndarray:
+    """Entropy-weighted stability :math:`C e^{-H}`."""
     entropy = np.maximum(entropy, 0.0)
     return coherence * np.exp(-entropy)
 
 
-def _stab_normalized(entropy, coherence):
+def _stab_normalized(entropy: np.ndarray, coherence: np.ndarray) -> np.ndarray:
+    """
+    Normalized stability functional:
+
+    .. math::
+
+        S = C_{norm} (1 - H_{norm})
+
+    """
     c = coherence.copy()
     if c.max() > c.min():
         c = (c - c.min()) / (c.max() - c.min() + 1e-12)
@@ -84,7 +184,20 @@ def _stab_normalized(entropy, coherence):
     return c * (1.0 - e)
 
 
-def _compute_stability(ent, coh, mode="classic"):
+def _compute_stability(ent: pd.Series, coh: pd.Series, mode="classic") -> np.ndarray:
+    """
+    Apply selected stability functional.
+
+    Parameters
+    ----------
+    ent : pandas.Series
+    coh : pandas.Series
+    mode : {"classic", "entropy_weighted", "normalized"}
+
+    Returns
+    -------
+    numpy.ndarray
+    """
     entropy = _safe(ent, default=0.0)
     coherence = _safe(coh, default=0.0)
 
@@ -98,9 +211,9 @@ def _compute_stability(ent, coh, mode="classic"):
     return _stab_classic(entropy, coherence)
 
 
-# --------------------------------------------------------------------------- #
-# Core API: compute element-level stability
-# --------------------------------------------------------------------------- #
+# =============================================================================
+# Element-Level Stability
+# =============================================================================
 
 def compute_signal_stability(
     elements_csv: str,
@@ -109,22 +222,32 @@ def compute_signal_stability(
     emit=DEFAULT_EMIT,
 ) -> None:
     """
-    Compute stability for each element in hilbert_elements.csv.
+    Compute element-level stability from entropy and coherence fields.
 
-    Produces:
-      - signal_stability.csv
-      - graph_stability_nodes.csv  (visualizer-ready)
-      - stability_meta.json
-      - graph_stability_meta.json
+    Parameters
+    ----------
+    elements_csv : str
+        Path to ``hilbert_elements.csv``.
+    out_csv : str
+        Output path for ``signal_stability.csv``.
+    mode : str, optional
+        Stability mode ("classic", "entropy_weighted", "normalized").
+    emit : callable, optional
+        Orchestrator logging callback.
 
-    signal_stability.csv schema:
-      doc, element, entropy, coherence, stability
+    Produces
+    --------
+    signal_stability.csv :
+        Legacy stable schema.
 
-    graph_stability_nodes.csv schema:
-      element, element_id,
-      entropy, coherence, stability,
-      tf, df, idf, tfidf,
-      lsa0, lsa1, lsa2
+    graph_stability_nodes.csv :
+        Graph-contract compatible table.
+
+    stability_meta.json :
+        Global statistical summary.
+
+    graph_stability_meta.json :
+        Graph visualizer metadata.
     """
     if not os.path.exists(elements_csv):
         _log(emit, "warn", "[stability] elements_csv missing", path=elements_csv)
@@ -142,31 +265,20 @@ def compute_signal_stability(
 
     _log(emit, "info", "[stability] loaded elements", n_rows=len(df), mode=mode)
 
-    # ----------------------------
-    # Resolve fields
-    # ----------------------------
-    entropy_col = None
-    coherence_col = None
-
-    for col in ("entropy", "mean_entropy"):
-        if col in df.columns:
-            entropy_col = col
-            break
-
-    for col in ("coherence", "mean_coherence"):
-        if col in df.columns:
-            coherence_col = col
-            break
+    # ---- Resolve entropy and coherence fields --------------------------------
+    entropy_col = next((c for c in ("entropy", "mean_entropy") if c in df.columns), None)
+    coherence_col = next((c for c in ("coherence", "mean_coherence") if c in df.columns), None)
 
     if entropy_col is None or coherence_col is None:
         _log(
             emit,
             "warn",
-            "[stability] missing entropy or coherence fields",
+            "[stability] missing entropy/coherence fields",
             columns=list(df.columns),
         )
         return
 
+    # ---- Resolve identifiers ---------------------------------------------------
     if "element" not in df.columns:
         df["element"] = df.get("token", df.index.astype(str)).astype(str)
 
@@ -176,18 +288,12 @@ def compute_signal_stability(
     if "doc" not in df.columns:
         df["doc"] = "corpus"
 
-    # ----------------------------
-    # Compute stability
-    # ----------------------------
+    # ---- Compute stability -----------------------------------------------------
     entropy = df[entropy_col]
     coherence = df[coherence_col]
-    stability = _compute_stability(entropy, coherence, mode=mode)
+    df["stability"] = _compute_stability(entropy, coherence, mode=mode)
 
-    df["stability"] = stability
-
-    # ----------------------------
-    # Legacy CSV (stable schema)
-    # ----------------------------
+    # ---- Legacy stability table ------------------------------------------------
     legacy = df[["doc", "element", entropy_col, coherence_col, "stability"]].copy()
     legacy = legacy.rename(
         columns={entropy_col: "entropy", coherence_col: "coherence"}
@@ -199,9 +305,7 @@ def compute_signal_stability(
     except Exception as exc:
         _log(emit, "warn", "[stability] failed to write signal_stability.csv", error=str(exc))
 
-    # ----------------------------
-    # Graph visualizer node table
-    # ----------------------------
+    # ---- Graph node table (visualizer) ----------------------------------------
     graph_cols = [
         "element", "element_id",
         entropy_col, coherence_col, "stability",
@@ -213,8 +317,7 @@ def compute_signal_stability(
         if c not in df.columns:
             df[c] = np.nan
 
-    graph_nodes = df[graph_cols].copy()
-    graph_nodes = graph_nodes.rename(
+    graph_nodes = df[graph_cols].rename(
         columns={entropy_col: "entropy", coherence_col: "coherence"}
     )
 
@@ -232,9 +335,7 @@ def compute_signal_stability(
     except Exception as exc:
         _log(emit, "warn", "[stability] failed to write graph_stability_nodes.csv", error=str(exc))
 
-    # ----------------------------
-    # Diagnostics meta
-    # ----------------------------
+    # ---- Meta diagnostics ------------------------------------------------------
     meta = {
         "mode": mode,
         "num_elements": int(graph_nodes["element"].nunique()),
@@ -256,7 +357,6 @@ def compute_signal_stability(
     except Exception as exc:
         _log(emit, "warn", "[stability] failed to write stability_meta.json", error=str(exc))
 
-    # Graph visualizer meta
     vis_meta = {
         "schema_version": "1.0",
         "mode": mode,
@@ -275,9 +375,9 @@ def compute_signal_stability(
     _log(emit, "info", "[stability] stability computation complete.")
 
 
-# --------------------------------------------------------------------------- #
-# Compound-level aggregation
-# --------------------------------------------------------------------------- #
+# =============================================================================
+# Compound-Level Aggregation
+# =============================================================================
 
 def compute_compound_stability(
     *,
@@ -290,7 +390,22 @@ def compute_compound_stability(
     """
     Aggregate element-level stability to the compound level.
 
-    Produces compound_stability.csv.
+    Parameters
+    ----------
+    compounds_json : str
+        Path to ``informational_compounds.json`` or directory containing it.
+    elements_csv : str
+        Path to ``hilbert_elements.csv``.
+    stability_csv : str
+        Path to ``signal_stability.csv``.
+    out_csv : str
+        Output path for ``compound_stability.csv``.
+    emit : callable
+
+    Returns
+    -------
+    str or None
+        Path to the output CSV, or None on failure.
     """
     base = Path(compounds_json).parent
     mol_path = base / "molecules.csv"
@@ -333,11 +448,14 @@ def compute_compound_stability(
         )
         return None
 
-    merged = mol_df.merge(stab_df[["element", "entropy", "coherence", "stability"]],
-                          on="element",
-                          how="left")
+    merged = mol_df.merge(
+        stab_df[["element", "entropy", "coherence", "stability"]],
+        on="element",
+        how="left",
+    )
 
     rows = []
+
     if "compound_id" not in merged.columns:
         _log(emit, "warn", "[compound-stability] molecules.csv missing compound_id")
         return None
@@ -356,8 +474,9 @@ def compute_compound_stability(
             }
         )
 
-    out_df = pd.DataFrame(rows)
-    out_df = out_df.sort_values("mean_element_stability", ascending=False)
+    out_df = pd.DataFrame(rows).sort_values(
+        "mean_element_stability", ascending=False
+    )
 
     try:
         out_df.to_csv(out_csv, index=False)

@@ -1,12 +1,43 @@
-# =============================================================================
-# hilbert_pipeline/hilbert_export.py - Deterministic Run Serialization
-# =============================================================================
 """
-Serialise a Hilbert pipeline run into a deterministic, easy to archive format.
+hilbert_export.py
+=================
 
-This version includes FIXES:
-  * ZIP artifact now emits an explicit "key" field (zip filename)
-    so orchestrator can register export_key into the DB.
+Hilbert Pipeline – Deterministic Export & Run Serialization (v3.1)
+------------------------------------------------------------------
+
+This module implements the *final archival step* of the Hilbert Information
+Pipeline. After all computational layers (LSA, fusion, edges, molecule,
+element-roots, stability, persistence visuals) have executed, the export module
+serialises the entire run into a **deterministic, reproducible, hash-stable**
+bundle containing:
+
+- ``hilbert_manifest.json`` – canonical run manifest with metrics and metadata.
+- A deterministic ZIP archive containing *all structured output artifacts*.
+- Artifact metadata (path, size, SHA256) used for versioned storage, caching,
+  frontend loading, and research reproducibility.
+
+Motivation
+----------
+
+In the Hilbert framework, the *epistemic field* of a corpus is represented by a
+collection of numerical, graphical, and structural artifacts.  
+This module ensures that the final result is:
+
+- fully self-describing,
+- inspector-friendly,
+- version-stable,
+- suitable for long-term archival in research repositories.
+
+Exports are deterministic: the exact same input directory produces bit-for-bit
+identical ZIPs, enabling cryptographic equivalence testing across runs.
+
+Public API
+----------
+
+.. autofunction:: build_manifest  
+.. autofunction:: export_zip  
+.. autofunction:: run_full_export
+
 """
 
 from __future__ import annotations
@@ -20,29 +51,55 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-# -------------------------------------------------------------------------#
-# Orchestrator compatibility emit
-# -------------------------------------------------------------------------#
+# --------------------------------------------------------------------------- #
+# Orchestrator-compatible logging
+# --------------------------------------------------------------------------- #
 try:
     from . import DEFAULT_EMIT  # type: ignore
 except Exception:
-    DEFAULT_EMIT = lambda *_a, **_k: None  # type: ignore
+    DEFAULT_EMIT = lambda *_a, **_k: None  # noqa: E731
 
 
-# -------------------------------------------------------------------------#
-# Helper functions for safe IO and simple stats
-# -------------------------------------------------------------------------#
+# =============================================================================
+# Numeric utilities
+# =============================================================================
+
 def _safe_mean(series: pd.Series, default: float = 0.0) -> float:
+    """
+    Compute a NaN-safe mean over a numeric series.
+
+    Parameters
+    ----------
+    series : pandas.Series
+        Input vector.
+    default : float
+        Returned if the series contains no finite values.
+
+    Returns
+    -------
+    float
+        Mean of the series or ``default``.
+    """
     if series is None or len(series) == 0:
         return default
+
     arr = pd.to_numeric(series, errors="coerce").to_numpy()
-    if arr.size == 0 or np.all(~np.isfinite(arr)):
+    arr = arr[np.isfinite(arr)]
+
+    if arr.size == 0:
         return default
     val = float(np.nanmean(arr))
     return val if np.isfinite(val) else default
 
 
+# =============================================================================
+# JSON + hashing utilities
+# =============================================================================
+
 def _read_json(path: str) -> Any:
+    """
+    Load JSON if present; return ``None`` otherwise.
+    """
     if not os.path.exists(path):
         return None
     try:
@@ -53,6 +110,21 @@ def _read_json(path: str) -> Any:
 
 
 def _sha256(path: str, chunk_size: int = 1 << 20) -> str:
+    """
+    Compute SHA-256 hash of a file.
+
+    Parameters
+    ----------
+    path : str
+        File to hash.
+    chunk_size : int
+        Read size in bytes.
+
+    Returns
+    -------
+    str
+        Hexadecimal digest.
+    """
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -63,16 +135,29 @@ def _sha256(path: str, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-# -------------------------------------------------------------------------#
-# Run level readers and light metrics
-# -------------------------------------------------------------------------#
+# =============================================================================
+# Run-level readers (for manifest metrics)
+# =============================================================================
+
 def _read_run_summary(out_dir: str) -> Dict[str, Any]:
-    path = os.path.join(out_dir, "hilbert_run.json")
-    data = _read_json(path)
+    """
+    Read ``hilbert_run.json`` if present.
+
+    Returns an empty dict if missing or unreadable.
+    """
+    data = _read_json(os.path.join(out_dir, "hilbert_run.json"))
     return data if isinstance(data, dict) else {}
 
 
 def _read_elements_info(out_dir: str) -> Dict[str, Any]:
+    """
+    Extract high-level element statistics from ``hilbert_elements.csv``:
+
+    - number of elements  
+    - number of unique tokens  
+    - mean entropy  
+    - mean coherence
+    """
     path = os.path.join(out_dir, "hilbert_elements.csv")
     if not os.path.exists(path):
         return {}
@@ -86,22 +171,21 @@ def _read_elements_info(out_dir: str) -> Dict[str, Any]:
 
     if "element" in df.columns:
         info["num_elements"] = int(df["element"].astype(str).nunique())
+
     if "token" in df.columns:
         info["num_tokens"] = int(df["token"].astype(str).nunique())
 
-    info["mean_entropy"] = (
-        _safe_mean(df.get("mean_entropy", df.get("entropy", pd.Series([], dtype=float))))
-    )
-    info["mean_coherence"] = (
-        _safe_mean(df.get("mean_coherence", df.get("coherence", pd.Series([], dtype=float))))
-    )
+    info["mean_entropy"] = _safe_mean(df.get("mean_entropy", df.get("entropy", pd.Series([], dtype=float))))
+    info["mean_coherence"] = _safe_mean(df.get("mean_coherence", df.get("coherence", pd.Series([], dtype=float))))
 
     return info
 
 
 def _read_num_spans(out_dir: str) -> Optional[int]:
-    path = os.path.join(out_dir, "lsa_field.json")
-    data = _read_json(path)
+    """
+    Count span embeddings in ``lsa_field.json`` (if available).
+    """
+    data = _read_json(os.path.join(out_dir, "lsa_field.json"))
     if not isinstance(data, dict):
         return None
     emb = data.get("embeddings")
@@ -109,6 +193,9 @@ def _read_num_spans(out_dir: str) -> Optional[int]:
 
 
 def _read_regime_profile(out_dir: str) -> Dict[str, float]:
+    """
+    Return average info/misinfo/disinfo scores across elements (if available).
+    """
     path = os.path.join(out_dir, "hilbert_elements.csv")
     if not os.path.exists(path):
         return {"info": 0.0, "misinfo": 0.0, "disinfo": 0.0}
@@ -118,14 +205,21 @@ def _read_regime_profile(out_dir: str) -> Dict[str, float]:
     except Exception:
         return {"info": 0.0, "misinfo": 0.0, "disinfo": 0.0}
 
-    info = _safe_mean(df.get("info_score", pd.Series([], dtype=float)))
-    mis = _safe_mean(df.get("misinfo_score", pd.Series([], dtype=float)))
-    dis = _safe_mean(df.get("disinfo_score", pd.Series([], dtype=float)))
-
-    return {"info": float(info), "misinfo": float(mis), "disinfo": float(dis)}
+    return {
+        "info": float(_safe_mean(df.get("info_score", pd.Series([], dtype=float)))),
+        "misinfo": float(_safe_mean(df.get("misinfo_score", pd.Series([], dtype=float)))),
+        "disinfo": float(_safe_mean(df.get("disinfo_score", pd.Series([], dtype=float)))),
+    }
 
 
 def _read_root_stats(out_dir: str) -> Dict[str, Any]:
+    """
+    Extract statistics from ``element_roots.csv``:
+
+    - number of root clusters  
+    - median cluster size  
+    - max cluster size
+    """
     path = os.path.join(out_dir, "element_roots.csv")
     stats = {"num_roots": None, "median_cluster_size": None, "max_cluster_size": None}
 
@@ -138,7 +232,7 @@ def _read_root_stats(out_dir: str) -> Dict[str, Any]:
         return stats
 
     if "element" in df.columns:
-        stats["num_roots"] = int(df["element"].astype(str).nunique())
+        stats["num_roots"] = int(df["root_id"].astype(str).nunique())
 
     if "cluster_size" in df.columns:
         sizes = pd.to_numeric(df["cluster_size"], errors="coerce")
@@ -151,6 +245,18 @@ def _read_root_stats(out_dir: str) -> Dict[str, Any]:
 
 
 def _read_graph_metrics(out_dir: str) -> Dict[str, Any]:
+    """
+    Read high-level graph metrics from ``edges.csv``.
+
+    Computes:
+
+    - number of nodes  
+    - number of edges  
+    - average degree  
+    - number of connected components  
+    - estimated number of communities  
+    - modularity (greedy optimisation)
+    """
     metrics = {
         "num_nodes": None,
         "num_edges": None,
@@ -183,27 +289,24 @@ def _read_graph_metrics(out_dir: str) -> Dict[str, Any]:
 
     metrics["num_nodes"] = n
     metrics["num_edges"] = m
-    metrics["avg_degree"] = 2.0 * m / float(n)
+    metrics["avg_degree"] = 2 * m / float(n)
 
+    # Optional graph analysis
     try:
         import networkx as nx
+        from networkx.algorithms.community import greedy_modularity_communities
+        from networkx.algorithms.community.quality import modularity
     except Exception:
         return metrics
 
     G = nx.Graph()
     for s, t in zip(sources, targets):
-        if s and t and s != t:
+        if s != t:
             G.add_edge(s, t)
-
-    if G.number_of_nodes() == 0:
-        return metrics
 
     metrics["num_components"] = nx.number_connected_components(G)
 
     try:
-        from networkx.algorithms.community import greedy_modularity_communities
-        from networkx.algorithms.community.quality import modularity
-
         comms = list(greedy_modularity_communities(G))
         metrics["num_communities"] = len(comms)
         if len(comms) > 1:
@@ -214,14 +317,25 @@ def _read_graph_metrics(out_dir: str) -> Dict[str, Any]:
     return metrics
 
 
-# -------------------------------------------------------------------------#
+# =============================================================================
 # Artifact discovery
-# -------------------------------------------------------------------------#
+# =============================================================================
+
 _STRUCTURED_EXT = {".csv", ".json", ".txt"}
 _STABLE_PREFIXES = ("stable_", "condensed_", "hilbert_manifest")
 
 
 def _discover_artifact_files(out_dir: str) -> List[Dict[str, Any]]:
+    """
+    Enumerate all structured artifacts in the run directory,
+    producing stable metadata for each.
+
+    Returns
+    -------
+    list of dict
+        Each dict contains:
+        ``path``, ``ext``, ``size_bytes``, ``sha256``.
+    """
     base = os.path.abspath(out_dir)
     rows: List[Dict[str, Any]] = []
 
@@ -230,14 +344,19 @@ def _discover_artifact_files(out_dir: str) -> List[Dict[str, Any]]:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in _STRUCTURED_EXT:
                 continue
+
             fpath = os.path.join(root, fname)
             if not os.path.isfile(fpath):
                 continue
+
             rel = os.path.relpath(fpath, base).replace("\\", "/")
             rows.append(
-                {"path": rel, "ext": ext,
-                 "size_bytes": os.path.getsize(fpath),
-                 "sha256": _sha256(fpath)}
+                {
+                    "path": rel,
+                    "ext": ext,
+                    "size_bytes": os.path.getsize(fpath),
+                    "sha256": _sha256(fpath),
+                }
             )
 
     rows.sort(key=lambda r: r["path"])
@@ -245,6 +364,9 @@ def _discover_artifact_files(out_dir: str) -> List[Dict[str, Any]]:
 
 
 def _identify_stable_artifacts(artifacts: List[Dict[str, Any]]) -> List[str]:
+    """
+    Identify artifacts whose names indicate stability (not widely used now).
+    """
     out = []
     for row in artifacts:
         name = os.path.basename(row["path"])
@@ -253,10 +375,40 @@ def _identify_stable_artifacts(artifacts: List[Dict[str, Any]]) -> List[str]:
     return sorted(out)
 
 
-# -------------------------------------------------------------------------#
+# =============================================================================
 # Manifest
-# -------------------------------------------------------------------------#
+# =============================================================================
+
 def build_manifest(out_dir: str, emit=DEFAULT_EMIT) -> str:
+    """
+    Construct ``hilbert_manifest.json`` summarising the entire run.
+
+    The manifest schema is:
+
+    ``schema_version``  
+        Integer version indicator.
+
+    ``run``  
+        Metadata from ``hilbert_run.json`` (run_id, corpus_dir, settings, env).
+
+    ``metrics``  
+        High-level statistics from spans, elements, graph, roots, regimes.
+
+    ``artifacts``  
+        List of structured outputs with size and SHA-256.
+
+    Parameters
+    ----------
+    out_dir : str
+        Path to the pipeline run directory.
+    emit : callable
+        Optional orchestrator logging callback.
+
+    Returns
+    -------
+    str
+        Path to the manifest JSON file.
+    """
     os.makedirs(out_dir, exist_ok=True)
 
     run_summary = _read_run_summary(out_dir)
@@ -280,7 +432,7 @@ def build_manifest(out_dir: str, emit=DEFAULT_EMIT) -> str:
         "versions": run_summary.get("versions") or {},
         "artifacts": {
             "files": _discover_artifact_files(out_dir),
-            "stable_paths": None,  # compatibility, rarely used now
+            "stable_paths": None,
         },
     }
 
@@ -297,10 +449,34 @@ def build_manifest(out_dir: str, emit=DEFAULT_EMIT) -> str:
     return path
 
 
-# -------------------------------------------------------------------------#
+# =============================================================================
 # ZIP Export
-# -------------------------------------------------------------------------#
+# =============================================================================
+
 def export_zip(out_dir: str, manifest_path: Optional[str] = None, emit=DEFAULT_EMIT):
+    """
+    Create ``hilbert_export.zip`` containing **every structured artifact**
+    in the run directory along with the manifest.
+
+    Files inside the ZIP are stored under a top-level directory equal to
+    the run folder name, ensuring unpacking does not spill into CWD.
+
+    Parameters
+    ----------
+    out_dir : str
+        Run directory.
+    manifest_path : str, optional
+        Path to manifest. If omitted, it is generated automatically.
+    emit : callable
+        Orchestrator logging callback.
+
+    Emits
+    -----
+    artifact event with fields:
+        ``path`` – ZIP path  
+        ``key`` – ZIP filename (for DB storage)  
+        ``kind`` – "hilbert_export_zip"
+    """
     base = os.path.abspath(out_dir)
     run_name = os.path.basename(base.rstrip(os.sep))
     zip_name = "hilbert_export.zip"
@@ -313,6 +489,7 @@ def export_zip(out_dir: str, manifest_path: Optional[str] = None, emit=DEFAULT_E
     files_meta = manifest.get("artifacts", {}).get("files", [])
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # structured artifacts
         for row in files_meta:
             rel = row.get("path")
             if not rel:
@@ -323,28 +500,47 @@ def export_zip(out_dir: str, manifest_path: Optional[str] = None, emit=DEFAULT_E
             arcname = os.path.join(run_name, rel)
             zf.write(fpath, arcname=arcname)
 
-        # ensure manifest included
-        rel_man = os.path.relpath(manifest_path, base).replace("\\", "/")
-        arcname = os.path.join(run_name, rel_man)
-        if not any(r.get("path") == rel_man for r in files_meta):
-            zf.write(manifest_path, arcname=arcname)
+        # ensure manifest is always included
+        rel_manifest = os.path.relpath(manifest_path, base).replace("\\", "/")
+        arc_manifest = os.path.join(run_name, rel_manifest)
+        if not any(r.get("path") == rel_manifest for r in files_meta):
+            zf.write(manifest_path, arcname=arc_manifest)
 
     print(f"[export] Created archive: {zip_path}")
 
-    # FIX: Emit explicit 'key' so orchestrator can register export_key
+    # explicit 'key' is required by orchestrator DB layer
     try:
-        emit("artifact",
-             {"path": zip_path,
-              "key": zip_name,     # <---- critical fix
-              "kind": "hilbert_export_zip"})
+        emit(
+            "artifact",
+            {
+                "path": zip_path,
+                "key": zip_name,
+                "kind": "hilbert_export_zip",
+            },
+        )
     except Exception:
         pass
 
 
-# -------------------------------------------------------------------------#
-# Public orchestrator entrypoint
-# -------------------------------------------------------------------------#
+# =============================================================================
+# Pipeline Entry
+# =============================================================================
+
 def run_full_export(out_dir: str, emit=DEFAULT_EMIT) -> None:
+    """
+    Execute the full export step:
+
+    1. Build ``hilbert_manifest.json``  
+    2. Create ``hilbert_export.zip``  
+    3. Emit orchestrator start/end events
+
+    Parameters
+    ----------
+    out_dir : str
+        Hilbert run directory.
+    emit : callable
+        Orchestrator logger.
+    """
     try:
         emit("pipeline", {"stage": "export", "event": "start"})
     except Exception:

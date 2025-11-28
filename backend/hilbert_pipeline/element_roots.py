@@ -1,66 +1,88 @@
-# =============================================================================
-# hilbert_pipeline/element_roots.py - Element Root Consolidator
-# =============================================================================
 """
-Consolidate surface-level elements into approximate "roots".
+element_roots.py
+================
 
-This module operates on the outputs of earlier Hilbert pipeline stages,
-in particular:
+Hilbert Information Pipeline – Element Root Consolidation Layer
+-----------------------------------------------------------------------------
 
-  - hilbert_elements.csv
-  - edges.csv (optional, for degree-based ranking)
+This module consolidates *surface-level elements* into coarse, interpretable
+root clusters. The purpose is *not* to perform full linguistic lemmatisation or
+semantic synonymy resolution. Instead, it applies transparent, reproducible
+heuristics to merge:
 
-It produces three artifacts:
+- trivial plural/singular alternations
+- cosmetic inflectional variants
+- obvious token-level morphological siblings
 
-  1. element_roots.csv
-       Per-element mapping to a root cluster.
+The output is a set of *root clusters* that help downstream visualisations,
+compound summaries, and analytics by reducing superficial element noise.
 
-       Columns:
-         - element: original element string
-         - root_id: cluster identifier (e.g. R0001)
-         - root_token: canonical root token/phrase
-         - representative: representative element label for the cluster
-         - cluster_size: number of elements in the cluster
-         - collection_freq: original collection_freq (if present)
-         - document_freq: original document_freq (if present)
+Inputs
+------
+- ``hilbert_elements.csv``  
+  Produced by the LSA layer; required.
 
-  2. element_clusters.json
-       Cluster-level summary keyed by root_id.
+- ``edges.csv`` *(optional)*  
+  Provided by the fusion/edges layer; used only to help choose a representative
+  member for each cluster (via degree ranking).
 
-       Each entry contains:
-         - root_id
-         - root_token
-         - label (representative element)
-         - cluster_size
-         - members: list of member element strings
-         - total_collection_freq
-         - total_document_freq
-         - mean_entropy
-         - mean_coherence
+Outputs
+-------
+This module produces three artifacts in ``results_dir``:
 
-  3. element_cluster_metrics.json
-       Global statistics over the clustering:
-         - n_elements
-         - n_roots
-         - n_singletons
-         - mean_cluster_size
-         - median_cluster_size
-         - max_cluster_size
-         - top_roots_by_size: small table of the largest clusters
+1. **element_roots.csv**  
+   One row per element.
 
-The goal is to provide a *conservative* consolidation step that groups
-obvious inflectional and cosmetic variants of the same underlying
-informational form, without pretending to solve full lemmatisation or
-synonymy. It is intentionally transparent and easy to extend.
+   Columns:
+       - ``element`` : str  
+       - ``root_id`` : str (``R0001`` pattern)  
+       - ``root_token`` : stemmed token phrase  
+       - ``representative`` : canonical element for the cluster  
+       - ``cluster_size`` : int  
+       - ``collection_freq`` : optional  
+       - ``document_freq`` : optional  
 
-Typical orchestrator usage:
+2. **element_clusters.json**  
+   One entry per cluster.
 
-    from hilbert_pipeline.element_roots import run_element_roots
-    run_element_roots(results_dir, emit=ctx.emit)
+   Keys:
+       - ``root_id``  
+       - ``root_token``  
+       - ``label`` (representative)  
+       - ``cluster_size``  
+       - ``members``  
+       - ``total_collection_freq``  
+       - ``total_document_freq``  
+       - ``mean_entropy``  
+       - ``mean_coherence``  
 
-If hilbert_elements.csv is missing or empty, the module logs a warning
-and no artifacts are written.
+3. **element_cluster_metrics.json**  
+   Global statistics:
+       - ``n_elements``  
+       - ``n_roots``  
+       - ``n_singletons``  
+       - ``mean_cluster_size``  
+       - ``median_cluster_size``  
+       - ``max_cluster_size``  
+       - ``top_roots_by_size``  
+
+Design Principles
+-----------------
+- **Conservative merging** – avoids over-aggressive conflation.  
+- **Deterministic ordering** – ensures reproducibility across runs.  
+- **Explainable heuristics** – only token-level transformations, no opaque NLP.  
+- **Orchestrator-safe logging** – uses injected ``emit`` callback.
+
+Pipeline Position
+-----------------
+This layer is run *after* the molecule/edge layers and *before* graph-level
+visualisation or export steps.
+
 """
+# ============================================================================
+# element_roots.py – Robust Edition
+# Hilbert Information Pipeline – Element Root Consolidation Layer
+# ============================================================================
 
 from __future__ import annotations
 
@@ -74,16 +96,24 @@ import numpy as np
 import pandas as pd
 
 
-# -------------------------------------------------------------------------
-# Orchestrator-compatible emitter
-# -------------------------------------------------------------------------
+# =============================================================================
+# Logging
+# =============================================================================
 
-DEFAULT_EMIT: Callable[[str, Dict[str, Any]], None] = lambda *_a, **_k: None  # type: ignore
+DEFAULT_EMIT: Callable[[str, Dict[str, Any]], None] = lambda *_a, **_k: None
 
 
-# -------------------------------------------------------------------------
-# Basic tokenisation + stemming heuristics
-# -------------------------------------------------------------------------
+def _safe_emit(emit: Callable, kind: str, payload: Dict[str, Any]) -> None:
+    """Emit without crashing orchestrator."""
+    try:
+        emit(kind, payload)
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Tokenisation / Stemming
+# =============================================================================
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 
@@ -91,64 +121,51 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 def _tokenise(text: str) -> List[str]:
     if not isinstance(text, str):
         return []
-    return _TOKEN_RE.findall(text.lower())
+    try:
+        return _TOKEN_RE.findall(text.lower())
+    except Exception:
+        return []
 
 
 def _stem_token(tok: str) -> str:
-    """
-    Very lightweight, explainable stemming heuristic.
-
-    - Lowercases input.
-    - Handles a few common English inflectional patterns.
-    - Leaves short tokens and acronyms alone.
-
-    This is not intended to be linguistically perfect; its aim is to
-    cluster obvious variants that would clearly be considered the same
-    "root" in downstream analysis.
-    """
     t = tok.lower()
     if len(t) <= 3:
         return t
 
-    # -ies -> y (stories -> story)
-    if len(t) > 4 and t.endswith("ies") and not t.endswith("eies"):
-        return t[:-3] + "y"
+    try:
+        if len(t) > 4 and t.endswith("ies") and not t.endswith("eies"):
+            return t[:-3] + "y"
 
-    # -ing, -ers, -er, -ed
-    for suf in ("ing", "ers", "er", "ed"):
-        if len(t) > len(suf) + 2 and t.endswith(suf):
-            return t[: -len(suf)]
+        for suf in ("ing", "ers", "er", "ed"):
+            if len(t) > len(suf) + 2 and t.endswith(suf):
+                return t[: -len(suf)]
 
-    # plural -es / -s (avoid chopping off in cases like 'class')
-    if len(t) > 3 and t.endswith("es") and not t.endswith("ses"):
-        return t[:-2]
-    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
-        return t[:-1]
+        if len(t) > 3 and t.endswith("es") and not t.endswith("ses"):
+            return t[:-2]
+        if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+            return t[:-1]
+    except Exception:
+        return t
 
     return t
 
 
 def _root_key(element: str) -> str:
-    """
-    Compute a canonical "root token" for an element.
-
-    - tokenises the element
-    - applies _stem_token to each token
-    - joins stems with single spaces
-
-    Falls back to the raw lowercased element if tokenisation yields
-    nothing (for example, non-alphanumeric strings).
-    """
     toks = _tokenise(element)
     if not toks:
         return (element or "").strip().lower()
-    stems = [_stem_token(t) for t in toks]
+    stems = []
+    for t in toks:
+        try:
+            stems.append(_stem_token(t))
+        except Exception:
+            stems.append(t)
     return " ".join(stems).strip()
 
 
-# -------------------------------------------------------------------------
-# Data structures
-# -------------------------------------------------------------------------
+# =============================================================================
+# Clustering Data Structure
+# =============================================================================
 
 @dataclass
 class RootCluster:
@@ -157,353 +174,275 @@ class RootCluster:
     members: List[str]
 
 
-# -------------------------------------------------------------------------
-# Core consolidation logic
-# -------------------------------------------------------------------------
+# =============================================================================
+# Loading Helpers
+# =============================================================================
 
-def _load_elements(elements_csv: str) -> pd.DataFrame:
-    if not os.path.exists(elements_csv):
-        raise FileNotFoundError(f"hilbert_elements.csv not found at {elements_csv}")
-    df = pd.read_csv(elements_csv)
+def _load_elements(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"hilbert_elements.csv missing: {path}")
+    df = pd.read_csv(path)
     if "element" not in df.columns:
-        raise ValueError("hilbert_elements.csv must contain an 'element' column.")
+        raise ValueError("Missing required column 'element'.")
     return df
 
 
-def _load_degrees(edges_csv: str) -> Dict[str, int]:
-    """
-    Optional degree map from edges.csv, used for ranking cluster representatives.
-
-    Returns a dict: element -> degree, or empty dict if edges.csv is missing.
-    """
-    if not os.path.exists(edges_csv):
+def _load_degrees(path: str) -> Dict[str, int]:
+    if not os.path.exists(path):
         return {}
+
     try:
-        edf = pd.read_csv(edges_csv)
+        edf = pd.read_csv(path)
     except Exception:
         return {}
+
     if "source" not in edf.columns or "target" not in edf.columns:
         return {}
 
-    degrees: Dict[str, int] = {}
+    deg: Dict[str, int] = {}
     for col in ("source", "target"):
-        vals = edf[col].astype(str)
-        for v in vals:
-            degrees[v] = degrees.get(v, 0) + 1
-    return degrees
+        try:
+            ser = edf[col].astype(str)
+            for v in ser:
+                deg[v] = deg.get(v, 0) + 1
+        except Exception:
+            continue
+    return deg
 
 
-def _build_clusters(
-    elements_df: pd.DataFrame,
-    degrees: Dict[str, int],
-) -> Tuple[List[RootCluster], Dict[str, RootCluster]]:
-    """
-    Group elements into root clusters.
+# =============================================================================
+# Clustering
+# =============================================================================
 
-    Strategy:
-      - compute root_token for each element
-      - group by root_token
-      - assign root_id = R0001, R0002, ... in descending cluster-size order
-      - return both the ordered list of RootCluster and an index
-        mapping element -> RootCluster
-    """
-    # Map root_token -> list[element]
+def _build_clusters(df: pd.DataFrame, degrees: Dict[str, int]) -> Tuple[List[RootCluster], Dict[str, RootCluster]]:
     bucket: Dict[str, List[str]] = {}
-    for el in elements_df["element"].astype(str):
-        rk = _root_key(el)
-        bucket.setdefault(rk, []).append(el)
 
-    # Order roots by cluster size (largest first), deterministic tiebreaker
-    sorted_roots = sorted(
-        bucket.items(),
-        key=lambda kv: (-len(kv[1]), kv[0]),
-    )
+    for raw_el in df["element"].astype(str):
+        try:
+            rk = _root_key(raw_el)
+        except Exception:
+            rk = raw_el.strip().lower()
+
+        bucket.setdefault(rk, []).append(str(raw_el))
+
+    # Deterministic ordering
+    sorted_items = sorted(bucket.items(), key=lambda kv: (-len(kv[1]), kv[0]))
 
     clusters: List[RootCluster] = []
-    element_to_cluster: Dict[str, RootCluster] = {}
+    e2c: Dict[str, RootCluster] = {}
 
-    for i, (rk, members) in enumerate(sorted_roots, start=1):
-        root_id = f"R{i:04d}"
-        uniq_members = sorted(set(members))
-        cluster = RootCluster(root_id=root_id, root_token=rk, members=uniq_members)
+    for idx, (rk, members) in enumerate(sorted_items, start=1):
+        uniq = sorted(set(members))
+        cid = f"R{idx:04d}"
+        cluster = RootCluster(root_id=cid, root_token=rk, members=uniq)
         clusters.append(cluster)
-        for el in uniq_members:
-            element_to_cluster[el] = cluster
+        for el in uniq:
+            e2c[el] = cluster
 
-    return clusters, element_to_cluster
+    return clusters, e2c
 
 
 def _select_representative(
     cluster: RootCluster,
-    elements_df: pd.DataFrame,
-    degrees: Dict[str, int],
+    df: pd.DataFrame,
+    degrees: Dict[str, int]
 ) -> str:
-    """
-    Choose a representative element for a cluster.
+    subset = df[df["element"].astype(str).isin(cluster.members)].copy()
 
-    Preference order:
-      1) Highest collection_freq (if present)
-      2) Highest graph degree (if degrees available)
-      3) Lexicographically smallest element
-    """
-    mset = set(cluster.members)
-    sub = elements_df[elements_df["element"].astype(str).isin(mset)].copy()
-
-    # 1) collection frequency
-    if "collection_freq" in sub.columns:
+    # 1. Highest collection frequency
+    if "collection_freq" in subset.columns:
         try:
-            sub["collection_freq"] = pd.to_numeric(
-                sub["collection_freq"], errors="coerce"
-            )
+            numeric = pd.to_numeric(subset["collection_freq"], errors="coerce")
+            if numeric.notna().any():
+                idx = numeric.idxmax()
+                return str(subset.loc[idx, "element"])
         except Exception:
             pass
-        if sub["collection_freq"].notna().any():
-            best = sub.sort_values("collection_freq", ascending=False).iloc[0]
-            return str(best["element"])
 
-    # 2) graph degree
+    # 2. Highest graph degree
     if degrees:
-        by_deg = sorted(
-            cluster.members,
-            key=lambda el: (-degrees.get(el, 0), el),
-        )
-        return by_deg[0]
+        try:
+            return sorted(cluster.members, key=lambda el: (-degrees.get(el, 0), el))[0]
+        except Exception:
+            pass
 
-    # 3) lexical fallback
+    # 3. Fallback
     return sorted(cluster.members)[0]
 
 
 def _safe_mean(series: pd.Series) -> Optional[float]:
     if series is None or series.empty:
         return None
-    arr = pd.to_numeric(series, errors="coerce").to_numpy()
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
+    try:
+        arr = pd.to_numeric(series, errors="coerce").to_numpy()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None
+        val = float(np.mean(arr))
+        return val if np.isfinite(val) else None
+    except Exception:
         return None
-    val = float(np.nanmean(arr))
-    return val if np.isfinite(val) else None
 
 
-def _write_cluster_artifacts(
-    out_dir: str,
-    elements_df: pd.DataFrame,
-    clusters: List[RootCluster],
-    element_to_cluster: Dict[str, RootCluster],
-    degrees: Dict[str, int],
-) -> None:
-    """
-    Write:
-      - element_roots.csv
-      - element_clusters.json
-      - element_cluster_metrics.json
-    """
-    os.makedirs(out_dir, exist_ok=True)
+# =============================================================================
+# Artifact Writing
+# =============================================================================
 
-    # Map stats per cluster
-    clusters_json: Dict[str, Dict[str, Any]] = {}
+def _write_cluster_artifacts(out: str, df: pd.DataFrame, clusters: List[RootCluster],
+                             e2c: Dict[str, RootCluster], degrees: Dict[str, int]) -> None:
+    os.makedirs(out, exist_ok=True)
 
-    element_rows: List[Dict[str, Any]] = []
+    rows = []
+    clusters_json: Dict[str, Any] = {}
 
-    # Pre-attach numeric columns if present
-    has_collection = "collection_freq" in elements_df.columns
-    has_document = "document_freq" in elements_df.columns
-    has_entropy = "entropy" in elements_df.columns
-    has_coherence = "coherence" in elements_df.columns
+    has_cf = "collection_freq" in df.columns
+    has_df = "document_freq" in df.columns
+    has_entropy = "entropy" in df.columns
+    has_coherence = "coherence" in df.columns
 
-    for cluster in clusters:
-        members = cluster.members
-        csize = len(members)
+    for c in clusters:
+        members = c.members
+        sub = df[df["element"].astype(str).isin(members)].copy()
 
-        sub = elements_df[elements_df["element"].astype(str).isin(members)].copy()
+        rep = _select_representative(c, df, degrees)
 
-        representative = _select_representative(cluster, elements_df, degrees)
+        # Compute cluster-level metrics
+        total_cf = None
+        total_df_ = None
+        mean_ent = None
+        mean_coh = None
 
-        total_collection = None
-        total_document = None
-        mean_entropy = None
-        mean_coherence = None
-
-        if has_collection:
+        if has_cf:
             try:
-                total_collection = float(
-                    pd.to_numeric(sub["collection_freq"], errors="coerce")
-                    .fillna(0.0)
-                    .sum()
-                )
+                nums = pd.to_numeric(sub["collection_freq"], errors="coerce").fillna(0)
+                total_cf = float(nums.sum())
             except Exception:
-                total_collection = None
+                total_cf = None
 
-        if has_document:
+        if has_df:
             try:
-                total_document = float(
-                    pd.to_numeric(sub["document_freq"], errors="coerce")
-                    .fillna(0.0)
-                    .sum()
-                )
+                nums = pd.to_numeric(sub["document_freq"], errors="coerce").fillna(0)
+                total_df_ = float(nums.sum())
             except Exception:
-                total_document = None
+                total_df_ = None
 
         if has_entropy:
-            mean_entropy = _safe_mean(sub["entropy"])
+            mean_ent = _safe_mean(sub["entropy"])
         if has_coherence:
-            mean_coherence = _safe_mean(sub["coherence"])
+            mean_coh = _safe_mean(sub["coherence"])
 
-        clusters_json[cluster.root_id] = {
-            "root_id": cluster.root_id,
-            "root_token": cluster.root_token,
-            "label": representative,
-            "cluster_size": csize,
+        clusters_json[c.root_id] = {
+            "root_id": c.root_id,
+            "root_token": c.root_token,
+            "label": rep,
+            "cluster_size": len(members),
             "members": members,
-            "total_collection_freq": total_collection,
-            "total_document_freq": total_document,
-            "mean_entropy": mean_entropy,
-            "mean_coherence": mean_coherence,
+            "total_collection_freq": total_cf,
+            "total_document_freq": total_df_,
+            "mean_entropy": mean_ent,
+            "mean_coherence": mean_coh,
         }
 
-        # element_roots rows (one row per element)
         for _, row in sub.iterrows():
-            el = str(row["element"])
-            element_rows.append(
-                {
-                    "element": el,
-                    "root_id": cluster.root_id,
-                    "root_token": cluster.root_token,
-                    "representative": representative,
-                    "cluster_size": csize,
-                    "collection_freq": row.get("collection_freq"),
-                    "document_freq": row.get("document_freq"),
-                }
-            )
+            rows.append({
+                "element": str(row["element"]),
+                "root_id": c.root_id,
+                "root_token": c.root_token,
+                "representative": rep,
+                "cluster_size": len(members),
+                "collection_freq": row.get("collection_freq"),
+                "document_freq": row.get("document_freq"),
+            })
 
-    # Write element_roots.csv
-    roots_path = os.path.join(out_dir, "element_roots.csv")
-    pd.DataFrame(element_rows).to_csv(roots_path, index=False)
+    pd.DataFrame(rows).to_csv(os.path.join(out, "element_roots.csv"), index=False)
 
-    # Write element_clusters.json
-    clusters_path = os.path.join(out_dir, "element_clusters.json")
-    with open(clusters_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(out, "element_clusters.json"), "w", encoding="utf-8") as f:
         json.dump(clusters_json, f, indent=2)
 
     # Global metrics
-    cluster_sizes = [len(c.members) for c in clusters]
-    n_elements = int(len(elements_df))
-    n_roots = int(len(clusters))
-    n_singletons = int(sum(1 for s in cluster_sizes if s == 1))
-
-    arr = np.asarray(cluster_sizes, dtype=float)
-    mean_size = float(np.mean(arr)) if arr.size else 0.0
-    median_size = float(np.median(arr)) if arr.size else 0.0
-    max_size = int(np.max(arr)) if arr.size else 0
-
-    # Top roots by size (for quick inspection)
-    top_by_size = sorted(
-        clusters,
-        key=lambda c: (-len(c.members), c.root_id),
-    )[:20]
-    top_table = [
-        {
-            "root_id": c.root_id,
-            "root_token": c.root_token,
-            "cluster_size": len(c.members),
-        }
-        for c in top_by_size
-    ]
-
+    sizes = [len(c.members) for c in clusters]
+    arr = np.asarray(sizes, dtype=float)
     metrics = {
-        "n_elements": n_elements,
-        "n_roots": n_roots,
-        "n_singletons": n_singletons,
-        "mean_cluster_size": mean_size,
-        "median_cluster_size": median_size,
-        "max_cluster_size": max_size,
-        "top_roots_by_size": top_table,
+        "n_elements": len(df),
+        "n_roots": len(clusters),
+        "n_singletons": sum(1 for s in sizes if s == 1),
+        "mean_cluster_size": float(arr.mean()) if arr.size else 0.0,
+        "median_cluster_size": float(np.median(arr)) if arr.size else 0.0,
+        "max_cluster_size": int(arr.max()) if arr.size else 0,
+        "top_roots_by_size": [
+            {
+                "root_id": c.root_id,
+                "root_token": c.root_token,
+                "cluster_size": len(c.members),
+            }
+            for c in sorted(clusters, key=lambda c: (-len(c.members), c.root_id))[:20]
+        ],
     }
 
-    metrics_path = os.path.join(out_dir, "element_cluster_metrics.json")
-    with open(metrics_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(out, "element_cluster_metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
 
-# -------------------------------------------------------------------------
+# =============================================================================
 # Public API
-# -------------------------------------------------------------------------
+# =============================================================================
 
-def run_element_roots(out_dir: str, emit: Callable[[str, Dict[str, Any]], None] = DEFAULT_EMIT) -> None:
-    """
-    High-level entry point used by the orchestrator.
-
-    Parameters
-    ----------
-    out_dir:
-        Hilbert run results directory (contains hilbert_elements.csv, edges.csv, etc.).
-
-    emit:
-        Optional logging callback compatible with the orchestrator:
-            emit(kind: str, payload: Dict[str, Any])
-
-    Side effects
-    ------------
-    Writes three files into out_dir:
-
-      - element_roots.csv
-      - element_clusters.json
-      - element_cluster_metrics.json
-    """
+def run_element_roots(out_dir: str,
+                      emit: Callable[[str, Dict[str, Any]], None] = DEFAULT_EMIT) -> None:
     elements_csv = os.path.join(out_dir, "hilbert_elements.csv")
     edges_csv = os.path.join(out_dir, "edges.csv")
 
-    try:
-        emit("log", {"stage": "element_roots", "event": "start"})
-    except Exception:
-        pass
+    _safe_emit(emit, "log", {"stage": "element_roots", "event": "start"})
 
-    if not os.path.exists(elements_csv):
-        msg = "[element-roots] hilbert_elements.csv not found; skipping root consolidation."
-        try:
-            emit("log", {"stage": "element_roots", "event": "skip", "reason": msg})
-        except Exception:
-            print(msg)
-        return
-
+    # Load elements
     try:
-        elements_df = _load_elements(elements_csv)
+        df = _load_elements(elements_csv)
     except Exception as exc:
-        msg = f"[element-roots] Failed to load hilbert_elements.csv: {exc}"
-        try:
-            emit("log", {"stage": "element_roots", "event": "error", "error": str(exc)})
-        except Exception:
-            print(msg)
+        _safe_emit(emit, "log", {
+            "stage": "element_roots",
+            "event": "error",
+            "error": str(exc),
+        })
         return
 
-    if elements_df.empty:
-        msg = "[element-roots] hilbert_elements.csv is empty; nothing to consolidate."
-        try:
-            emit("log", {"stage": "element_roots", "event": "skip", "reason": msg})
-        except Exception:
-            print(msg)
+    if df.empty:
+        _safe_emit(emit, "log", {
+            "stage": "element_roots",
+            "event": "skip",
+            "reason": "hilbert_elements.csv empty"
+        })
         return
 
     degrees = _load_degrees(edges_csv)
 
-    clusters, element_to_cluster = _build_clusters(elements_df, degrees)
-
-    _write_cluster_artifacts(out_dir, elements_df, clusters, element_to_cluster, degrees)
-
+    # Build clusters
     try:
-        emit(
-            "log",
-            {
-                "stage": "element_roots",
-                "event": "end",
-                "n_elements": int(len(elements_df)),
-                "n_roots": int(len(clusters)),
-            },
-        )
-    except Exception:
-        print(
-            f"[element-roots] Completed root consolidation: "
-            f"{len(elements_df)} elements -> {len(clusters)} roots."
-        )
+        clusters, e2c = _build_clusters(df, degrees)
+    except Exception as exc:
+        _safe_emit(emit, "log", {
+            "stage": "element_roots",
+            "event": "error",
+            "error": f"Cluster build failed: {exc}"
+        })
+        return
+
+    # Write artifacts
+    try:
+        _write_cluster_artifacts(out_dir, df, clusters, e2c, degrees)
+    except Exception as exc:
+        _safe_emit(emit, "log", {
+            "stage": "element_roots",
+            "event": "error",
+            "error": f"Artifact writing failed: {exc}"
+        })
+        return
+
+    _safe_emit(emit, "log", {
+        "stage": "element_roots",
+        "event": "end",
+        "n_elements": len(df),
+        "n_roots": len(clusters),
+    })
 
 
 __all__ = ["run_element_roots"]

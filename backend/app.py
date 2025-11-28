@@ -3,12 +3,11 @@ from __future__ import annotations
 """
 Hilbert Information Laboratory Backend API (DB-integrated version)
 
-Integrated with:
-  - hilbert_orchestrator 4.1 event model (run_start, stage_start, stage_end, run_end)
-  - SQLite database auto-reset
-  - Correct DB artifact registration
-  - Graph / elements / molecules / stability APIs
-  - CORS for local development
+Updated to use the new modular orchestrator subsystem:
+
+    - hilbert_orchestrator.hilbert_run.hilbert_run
+    - Modular stage registry
+    - Structured event model
 """
 
 import json
@@ -49,19 +48,34 @@ WORK_BASE.mkdir(parents=True, exist_ok=True)
 
 from hilbert_db.core import create_hilbert_db
 
-db = create_hilbert_db(init_schema=True)
+try:
+    db = create_hilbert_db(init_schema=True)
+except Exception as exc:
+    # Very early failure - make this as loud as possible
+    print(json.dumps({
+        "msg": "[app] Failed to initialise HilbertDB",
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }, ensure_ascii=False))
+    raise
 
 # ============================================================================
-# Orchestrator 4.1
+# New Orchestrator Import
 # ============================================================================
 
 try:
-    from hilbert_orchestrator import run_hilbert_orchestration, PipelineSettings
+    from hilbert_orchestrator.cli.hilbert_run import hilbert_run, PipelineSettings
 except Exception as exc:
-    raise RuntimeError(f"[app] Failed to import hilbert_orchestrator: {exc}")
+    # Explicit debug info if orchestrator import fails (e.g. circular import)
+    print(json.dumps({
+        "msg": "[app] Failed to import hilbert_orchestrator module",
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }, ensure_ascii=False))
+    raise RuntimeError(f"[app] Failed to import hilbert_orchestrator module: {exc}")
 
 # ============================================================================
-# FastAPI app
+# FastAPI App Setup
 # ============================================================================
 
 app = FastAPI(
@@ -69,7 +83,6 @@ app = FastAPI(
     version="4.1.0",
 )
 
-# CORS for local development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -91,10 +104,26 @@ if FRONTEND_BUILD.exists():
 # Helpers
 # ============================================================================
 
-def _log(msg: str, **extra: Any):
-    print(json.dumps({"msg": msg, **extra}, ensure_ascii=False))
+def _log(msg: str, **extra: Any) -> None:
+    """
+    Centralised structured logging.
+
+    All logs go through here so we can easily tweak format or sink later.
+    """
+    try:
+        print(json.dumps({"msg": msg, **extra}, ensure_ascii=False))
+    except Exception:
+        # Last-ditch fallback - never let logging crash the app
+        print(f"{msg} {extra}")
+
 
 def _json_safe(v: Any) -> Any:
+    """
+    Make values JSON safe by:
+
+        - converting NaN/inf floats to None
+        - recursing into dicts/lists
+    """
     if isinstance(v, float):
         return v if math.isfinite(v) else None
     if isinstance(v, dict):
@@ -102,6 +131,7 @@ def _json_safe(v: Any) -> Any:
     if isinstance(v, list):
         return [_json_safe(x) for x in v]
     return v
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -112,8 +142,12 @@ async def log_requests(request: Request, call_next):
     except Exception as exc:
         _log("[http] error", error=str(exc), traceback=traceback.format_exc())
         raise
-    _log("[http] response", path=request.url.path,
-         duration_ms=int((time.time() - start) * 1000))
+    _log(
+        "[http] response",
+        path=request.url.path,
+        duration_ms=int((time.time() - start) * 1000),
+        status_code=getattr(resp, "status_code", None),
+    )
     return resp
 
 # ============================================================================
@@ -123,6 +157,7 @@ async def log_requests(request: Request, call_next):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return "<h1>Hilbert DB API Running</h1>"
+
 
 @app.get("/health")
 async def health():
@@ -143,31 +178,60 @@ async def upload_corpus(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(400, "No files uploaded.")
 
+    _log("[api] upload_corpus", n_files=len(files))
+
     shutil.rmtree(UPLOAD_BASE, ignore_errors=True)
     UPLOAD_BASE.mkdir(parents=True, exist_ok=True)
 
-    saved = []
+    saved: List[str] = []
     for up in files:
         dest = UPLOAD_BASE / up.filename
-        dest.write_bytes(await up.read())
-        saved.append(up.filename)
+        try:
+            dest.write_bytes(await up.read())
+            saved.append(up.filename)
+        except Exception as exc:
+            _log("[api] upload_corpus write failed",
+                 filename=up.filename, error=str(exc),
+                 traceback=traceback.format_exc())
+            raise HTTPException(500, f"Failed to save {up.filename}: {exc}")
 
+    _log("[api] upload_corpus complete", saved=saved)
     return {"status": "ok", "files": saved}
 
+
 def _detect_corpus_arg() -> str:
-    """If there's exactly one ZIP, use that, otherwise use folder."""
+    """
+    If exactly one ZIP exists in UPLOAD_BASE, treat it as the corpus;
+    otherwise use the upload directory directly.
+    """
     zips = [p for p in UPLOAD_BASE.iterdir() if p.suffix.lower() == ".zip"]
-    return str(zips[0]) if len(zips) == 1 else str(UPLOAD_BASE)
+    if len(zips) == 1:
+        arg = str(zips[0])
+        _log("[api] corpus_arg selected zip", path=arg)
+        return arg
+    arg = str(UPLOAD_BASE)
+    _log("[api] corpus_arg selected directory", path=arg)
+    return arg
 
 # ============================================================================
 # Pipeline entry
 # ============================================================================
 
-def _emit_bridge(kind: str, payload: Dict[str, Any]):
+def _emit_bridge(kind: str, payload: Dict[str, Any]) -> None:
     """
-    Translate orchestrator events into backend logs.
+    Bridge orchestrator events to backend structured logs.
+
+    This gives you a clean stream of:
+
+        [pipeline:run_start]
+        [pipeline:stage_start]
+        [pipeline:stage_end]
+        [pipeline:run_end]
+        [pipeline:log]
+        [pipeline:artifact]
     """
-    _log(f"[pipeline:{kind}]", **payload)
+    _log(f"[pipeline:{kind}]", **_json_safe(payload))
+
 
 @router.post("/analyze_corpus")
 async def analyze_corpus(
@@ -176,15 +240,21 @@ async def analyze_corpus(
     corpus_name: str = "Uploaded Corpus",
 ):
     corpus_arg = _detect_corpus_arg()
-
     workdir = WORK_BASE / f"run_{int(time.time()*1000)}"
     workdir.mkdir(parents=True, exist_ok=True)
 
     settings = PipelineSettings(use_native=use_native, max_docs=max_docs)
 
+    _log(
+        "[api] analyze_corpus starting",
+        corpus_arg=corpus_arg,
+        workdir=str(workdir),
+        settings=_json_safe(settings.as_dict()),
+    )
+
     try:
-        result = run_hilbert_orchestration(
-            db,
+        result = hilbert_run(
+            db=db,
             corpus_dir=corpus_arg,
             corpus_name=str(corpus_name),
             results_dir=str(workdir),
@@ -192,11 +262,24 @@ async def analyze_corpus(
             emit=_emit_bridge,
         )
     except Exception as exc:
-        _log("[api] pipeline failed", error=str(exc),
-             traceback=traceback.format_exc())
+        _log(
+            "[api] pipeline failed",
+            error=str(exc),
+            traceback=traceback.format_exc(),
+            corpus_arg=corpus_arg,
+            workdir=str(workdir),
+        )
         raise HTTPException(500, f"Pipeline failed: {exc}")
 
+    _log(
+        "[api] analyze_corpus complete",
+        run_id=result.get("run_id"),
+        corpus_id=result.get("corpus_id"),
+        results_dir=result.get("results_dir"),
+    )
+
     return {"status": "ok", "result": _json_safe(result)}
+
 
 @router.post("/run_full")
 async def run_full(use_native: bool = True):
@@ -211,15 +294,17 @@ async def api_list_corpora():
     corp = db.list_corpora()
     return {"corpora": [_json_safe(c.__dict__) for c in corp]}
 
+
 @router.get("/runs")
 async def api_list_runs(corpus_id: Optional[str] = Query(None)):
     if corpus_id:
         r = db.list_runs_for_corpus(corpus_id)
     else:
-        r = []
+        r: List[Any] = []
         for c in db.list_corpora():
             r.extend(db.list_runs_for_corpus(c.corpus_id))
     return {"runs": [_json_safe(x.__dict__) for x in r]}
+
 
 @router.get("/runs/{run_id}")
 async def api_get_run(run_id: str):
@@ -227,6 +312,7 @@ async def api_get_run(run_id: str):
     if not r:
         raise HTTPException(404, f"Run {run_id} not found")
     return _json_safe(r.__dict__)
+
 
 @router.get("/runs/{run_id}/artifacts")
 async def api_run_artifacts(run_id: str):
@@ -246,10 +332,13 @@ async def api_graph_available(run_id: str):
     try:
         return {
             "run_id": run_id,
-            "available": list_available_graphs(db, run_id)
+            "available": list_available_graphs(db, run_id),
         }
     except Exception as exc:
+        _log("[api] graph_available failed", run_id=run_id,
+             error=str(exc), traceback=traceback.format_exc())
         raise HTTPException(500, f"Graph not available: {exc}")
+
 
 @router.get("/graphs/{run_id}/snapshot")
 async def api_graph_snapshot(run_id: str, depth: Optional[str] = None):
@@ -264,10 +353,12 @@ async def api_graph_snapshot(run_id: str, depth: Optional[str] = None):
             "metadata": _json_safe(snap.metadata),
         }
     except Exception as exc:
+        _log("[api] graph_snapshot failed", run_id=run_id,
+             error=str(exc), traceback=traceback.format_exc())
         raise HTTPException(500, f"Graph snapshot failed: {exc}")
 
 # ============================================================================
-# Elements
+# Elements API
 # ============================================================================
 
 from hilbert_db.apis.elements_api import (
@@ -287,6 +378,7 @@ async def api_elements(run_id: str, page: int = 1, page_size: int = 200):
         "items": _json_safe([asdict(x) for x in elems[start:start + page_size]]),
     }
 
+
 @router.get("/runs/{run_id}/elements/{element_id}")
 async def api_element(run_id: str, element_id: str):
     try:
@@ -295,10 +387,13 @@ async def api_element(run_id: str, element_id: str):
     except KeyError:
         raise HTTPException(404, f"Element {element_id} not found")
     except Exception as exc:
+        _log("[api] element detail failed", run_id=run_id,
+             element_id=element_id, error=str(exc),
+             traceback=traceback.format_exc())
         raise HTTPException(500, str(exc))
 
 # ============================================================================
-# Molecules
+# Molecules API
 # ============================================================================
 
 try:
@@ -327,6 +422,9 @@ try:
         except KeyError:
             raise HTTPException(404, f"Molecule {molecule_id} not found")
         except Exception as exc:
+            _log("[api] molecule detail failed", run_id=run_id,
+                 molecule_id=molecule_id, error=str(exc),
+                 traceback=traceback.format_exc())
             raise HTTPException(500, str(exc))
 
 except ImportError:
@@ -346,17 +444,17 @@ from hilbert_db.apis.stability_api import (
 async def api_stability_table(run_id: str):
     return {
         "run_id": run_id,
-        "items": _json_safe([
-            asdict(p) for p in get_stability_table(db, run_id)
-        ])
+        "items": _json_safe([asdict(p) for p in get_stability_table(db, run_id)]),
     }
+
 
 @router.get("/runs/{run_id}/stability/compounds")
 async def api_stability_compounds(run_id: str):
     return {
         "run_id": run_id,
-        "items": _json_safe(get_compound_stability(db, run_id))
+        "items": _json_safe(get_compound_stability(db, run_id)),
     }
+
 
 @router.get("/runs/{run_id}/persistence_field")
 async def api_persistence_field(run_id: str):
@@ -394,7 +492,7 @@ def _find_candidate_db_paths() -> list[Path]:
         Path("hilbert.db"),
     ]
 
-    uniq = []
+    uniq: list[Path] = []
     seen = set()
     for p in paths:
         s = str(p)
@@ -420,13 +518,16 @@ async def admin_reset_db():
         _log("[admin] deleting DB file", path=str(db_file))
         db_file.unlink()
     except Exception as exc:
-        _log("[admin] unlink failed", error=str(exc))
+        _log("[admin] unlink failed", error=str(exc),
+             traceback=traceback.format_exc())
         raise HTTPException(500, f"Failed to delete {db_file}: {exc}")
 
     global db
     try:
         db = create_hilbert_db(init_schema=True)
     except Exception as exc:
+        _log("[admin] recreate schema failed", error=str(exc),
+             traceback=traceback.format_exc())
         raise HTTPException(500, f"DB deleted but schema failed to recreate: {exc}")
 
     return {
